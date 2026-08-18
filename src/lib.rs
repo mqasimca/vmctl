@@ -9,13 +9,15 @@ mod qemu;
 use std::collections::BTreeSet;
 use std::env;
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use clap::CommandFactory;
-use clap_complete::{Shell, generate};
+use clap_complete::{CompleteEnv, Shell};
 
 #[cfg(unix)]
 use std::os::unix::{fs::PermissionsExt, process::CommandExt};
@@ -24,7 +26,7 @@ use serde_json::{Value, json};
 
 use cli::{
     Cli, Command as VmCommand, DiskAction, GuestAction, HostAction, LaunchOptions, OutputFormat,
-    SnapshotAction,
+    SnapshotAction, StartWait,
 };
 use config::{discover, find};
 use paths::Dirs;
@@ -68,8 +70,14 @@ pub fn run(cli: Cli) -> Result<()> {
             redact,
             options,
         } => plan_vm(&dirs, &vm, &options, output, redact),
-        VmCommand::Start { vm, options } => start_vm(&dirs, &vm, &options, output),
+        VmCommand::Start {
+            vm,
+            options,
+            wait,
+            wait_timeout,
+        } => start_vm(&dirs, &vm, &options, wait, wait_timeout, output),
         VmCommand::Ssh { vm, user } => ssh_vm(&dirs, &vm, user.as_deref()),
+        VmCommand::View { vm, viewer } => view_vm(&dirs, &vm, viewer.as_deref(), output),
         VmCommand::Stop { vm, timeout, force } => stop_vm(&dirs, &vm, timeout, force, output),
         VmCommand::Kill { vm } => kill_vm(&dirs, &vm, output),
         VmCommand::Logs { vm, lines } => logs_vm(&dirs, &vm, lines as usize, output),
@@ -83,7 +91,7 @@ pub fn run(cli: Cli) -> Result<()> {
             let _operation_lock = acquire_vm_lock(&vm.paths)?;
             stop_vm_loaded(&vm, timeout, force, output, false)?;
             apply_launch_options(&mut vm, &options)?;
-            start_vm_loaded(&vm, output)
+            start_vm_loaded(&vm, output, None)
         }
         VmCommand::Snapshot { vm, action } => snapshot_vm(&dirs, &vm, action, output),
         VmCommand::Disk { vm, action } => disk_vm(&dirs, &vm, action, output),
@@ -100,9 +108,15 @@ pub fn run(cli: Cli) -> Result<()> {
 }
 
 fn generate_completions(shell: Shell) -> Result<()> {
-    let mut command = Cli::command();
-    let name = command.get_name().to_string();
-    generate(shell, &mut command, name, &mut std::io::stdout());
+    let shell = shell.to_string();
+    // Safe: this process uses the variable only to generate the requested script.
+    unsafe { env::set_var("VMCTL_COMPLETE", shell) };
+    let args = [env::args_os().next().unwrap_or_else(|| "vmctl".into())];
+    let current_dir = env::current_dir().ok();
+    CompleteEnv::with_factory(Cli::command)
+        .var("VMCTL_COMPLETE")
+        .try_complete(args, current_dir.as_deref())
+        .map_err(|error| Error::message(error.to_string()))?;
     Ok(())
 }
 
@@ -175,10 +189,19 @@ fn plan_vm(
     Ok(())
 }
 
-fn start_vm(dirs: &Dirs, name: &str, options: &LaunchOptions, output: OutputFormat) -> Result<()> {
+fn start_vm(
+    dirs: &Dirs,
+    name: &str,
+    options: &LaunchOptions,
+    wait: Option<StartWait>,
+    wait_timeout: u64,
+    output: OutputFormat,
+) -> Result<()> {
     let vm = load_effective_vm(dirs, name, options)?;
     let _operation_lock = acquire_vm_lock(&vm.paths)?;
-    start_vm_loaded(&vm, output)
+    let wait_for_ssh =
+        matches!(wait, Some(StartWait::Ssh)).then_some(Duration::from_secs(wait_timeout));
+    start_vm_loaded(&vm, output, wait_for_ssh)
 }
 
 fn ssh_vm(dirs: &Dirs, name: &str, user: Option<&str>) -> Result<()> {
@@ -189,18 +212,8 @@ fn ssh_vm(dirs: &Dirs, name: &str, user: Option<&str>) -> Result<()> {
             vm.config.name
         )));
     }
-    let port = runtime_port(&vm.paths.state_dir.join("ports"), "ssh")
-        .or(vm.config.ssh_port)
-        .ok_or_else(|| {
-            Error::message(format!(
-                "{} has no active SSH forward; set ssh_port and restart it",
-                vm.config.name
-            ))
-        })?;
-    let host = match vm.config.ssh_access.as_str() {
-        "" | "local" | "remote" => "127.0.0.1",
-        host => host,
-    };
+    let port = active_ssh_port(&vm)?;
+    let host = ssh_connect_host(&vm.config);
     let mut command = ProcessCommand::new("ssh");
     command
         .args(vm_ssh_options())
@@ -220,9 +233,130 @@ fn ssh_vm(dirs: &Dirs, name: &str, user: Option<&str>) -> Result<()> {
     }
 }
 
-fn start_vm_loaded(vm: &Vm, output: OutputFormat) -> Result<()> {
+fn view_vm(dirs: &Dirs, name: &str, viewer: Option<&str>, output: OutputFormat) -> Result<()> {
+    let vm = find(&dirs.vm_dir, &dirs.state_root, name)?;
+    if !matches!(vm.state()?, VmState::Running(_)) {
+        return Err(Error::message(format!(
+            "{} is not running; start it before opening its display",
+            vm.config.name
+        )));
+    }
+    let port = runtime_port(&vm.paths.state_dir.join("ports"), "spice");
+    if port.is_none() && !vm.paths.spice_socket().exists() {
+        return Err(Error::message(format!(
+            "{} has no active SPICE display; restart it with --display none, --display spice, or --display spice-app",
+            vm.config.name
+        )));
+    }
+    let viewer =
+        viewer
+            .filter(|viewer| !viewer.is_empty())
+            .unwrap_or(if vm.config.viewer == "none" {
+                "remote-viewer"
+            } else {
+                &vm.config.viewer
+            });
+    start_viewer(&vm, viewer, port)?;
+    let endpoint = port.map_or_else(
+        || format!("spice+unix://{}", vm.paths.spice_socket().display()),
+        |port| format!("spice://{}:{port}", spice_address(&vm.config)),
+    );
+    if output == OutputFormat::Json {
+        println!(
+            "{}",
+            json!({ "name": vm.config.name, "viewer": viewer, "endpoint": endpoint })
+        );
+    } else {
+        println!("Opened {viewer} for {}", vm.config.name);
+    }
+    Ok(())
+}
+
+fn active_ssh_port(vm: &Vm) -> Result<u16> {
+    runtime_port(&vm.paths.state_dir.join("ports"), "ssh")
+        .or(vm.config.ssh_port)
+        .ok_or_else(|| {
+            Error::message(format!(
+                "{} has no active SSH forward; use network=user or network=passt and restart it",
+                vm.config.name
+            ))
+        })
+}
+
+fn ssh_connect_host(config: &VmConfig) -> &str {
+    match config.ssh_access.as_str() {
+        "" | "local" | "remote" => "127.0.0.1",
+        host => host,
+    }
+}
+
+fn wait_for_ssh_ready(vm: &Vm, timeout: Duration, output: OutputFormat) -> Result<()> {
+    let port = active_ssh_port(vm)?;
+    let host = ssh_connect_host(&vm.config);
+    let endpoint = if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    let addresses = endpoint
+        .to_socket_addrs()
+        .map_err(|error| Error::io(format!("SSH endpoint {endpoint}"), error))?
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err(Error::message(format!(
+            "SSH endpoint {endpoint} did not resolve; check ssh_access"
+        )));
+    }
+    if output == OutputFormat::Human {
+        eprintln!(
+            "vmctl: waiting up to {}s for SSH on {endpoint}",
+            timeout.as_secs()
+        );
+    }
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !matches!(vm.state()?, VmState::Running(_)) {
+            return Err(Error::message(format!(
+                "{} stopped before SSH became ready; run `vmctl logs {}`",
+                vm.config.name, vm.config.name
+            )));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let attempt_timeout = remaining.min(Duration::from_millis(500));
+        if addresses
+            .iter()
+            .copied()
+            .any(|address| has_ssh_banner(address, attempt_timeout))
+        {
+            return Ok(());
+        }
+        thread::sleep(remaining.min(Duration::from_millis(100)));
+    }
+    Err(Error::message(format!(
+        "SSH on {endpoint} was not ready after {}s; the VM is still running. Check `vmctl logs {}` or `vmctl doctor {}`",
+        timeout.as_secs(),
+        vm.config.name,
+        vm.config.name
+    )))
+}
+
+fn has_ssh_banner(address: SocketAddr, timeout: Duration) -> bool {
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, timeout) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(timeout));
+    let mut banner = [0; 4];
+    stream
+        .read_exact(&mut banner)
+        .is_ok_and(|_| banner == *b"SSH-")
+}
+
+fn start_vm_loaded(vm: &Vm, output: OutputFormat, wait_for_ssh: Option<Duration>) -> Result<()> {
     if let VmState::Running(pid) = vm.state()? {
         let viewer_reconnected = reconnect_viewer(vm, output == OutputFormat::Json);
+        if let Some(timeout) = wait_for_ssh {
+            wait_for_ssh_ready(vm, timeout, output)?;
+        }
         if output == OutputFormat::Json {
             println!(
                 "{}",
@@ -231,6 +365,7 @@ fn start_vm_loaded(vm: &Vm, output: OutputFormat) -> Result<()> {
                     "state": "running",
                     "pid": pid,
                     "viewer_reconnected": viewer_reconnected,
+                    "waited_for_ssh": wait_for_ssh.is_some(),
                 })
             );
         } else {
@@ -373,6 +508,10 @@ fn start_vm_loaded(vm: &Vm, output: OutputFormat) -> Result<()> {
     }
     let viewer_started = launch_viewer(vm, &plan, output == OutputFormat::Json);
 
+    if let Some(timeout) = wait_for_ssh {
+        wait_for_ssh_ready(vm, timeout, output)?;
+    }
+
     if output == OutputFormat::Json {
         println!(
             "{}",
@@ -388,6 +527,7 @@ fn start_vm_loaded(vm: &Vm, output: OutputFormat) -> Result<()> {
                 "log": log_path,
                 "command": vm.paths.state_dir.join("qemu.command"),
                 "viewer_started": viewer_started,
+                "waited_for_ssh": wait_for_ssh.is_some(),
             })
         );
     } else {
@@ -405,6 +545,9 @@ fn start_vm_loaded(vm: &Vm, output: OutputFormat) -> Result<()> {
                 "  spice: {}:{port}",
                 plan.spice_host.as_deref().unwrap_or("127.0.0.1")
             );
+        }
+        if wait_for_ssh.is_some() {
+            println!("  ssh:   ready");
         }
     }
     Ok(())
@@ -916,6 +1059,7 @@ fn report_host(output: OutputFormat) -> Result<()> {
             "qemu-system-x86_64": command_available("qemu-system-x86_64"),
             "qemu-system-aarch64": command_available("qemu-system-aarch64"),
             "qemu-img": command_available("qemu-img"),
+            "passt": command_available("passt"),
             "swtpm": command_available("swtpm"),
             "qemu-bridge-helper": find_command("qemu-bridge-helper").is_some(),
             "virtiofsd": virtiofsd_available(),
@@ -944,6 +1088,7 @@ fn report_host(output: OutputFormat) -> Result<()> {
         println!("cpu cores: {}", report["cpu_cores"]);
         println!("kvm: {}", report["kvm"]);
         println!("qemu-img: {}", report["commands"]["qemu-img"]);
+        println!("passt: {}", report["commands"]["passt"]);
         println!(
             "qemu version: {}",
             report["versions"][native_qemu.as_str()]
@@ -1085,6 +1230,45 @@ fn doctor(dirs: &Dirs, name: Option<&str>, output: OutputFormat) -> Result<()> {
             );
         }
     }
+    let passt_backend = qemu_capabilities["network_backends"]
+        .as_array()
+        .is_some_and(|backends| backends.iter().any(|backend| backend == "passt"));
+    let passt_path = find_command("passt");
+    let (status, message, hint) = if env::consts::OS != "linux" {
+        (
+            "skip",
+            "passt networking is currently documented for Linux hosts".to_string(),
+            None,
+        )
+    } else if qemu_capabilities["available"] != true {
+        (
+            "skip",
+            "QEMU is unavailable; passt was not checked".to_string(),
+            None,
+        )
+    } else if !passt_backend {
+        (
+            "warn",
+            "QEMU does not support the passt network backend".to_string(),
+            Some("Install QEMU 10.1 or newer, or use network=user."),
+        )
+    } else if let Some(path) = passt_path {
+        ("ok", format!("passt is available at {path}"), None)
+    } else {
+        (
+            "warn",
+            "QEMU supports passt, but the passt executable is unavailable".to_string(),
+            Some("Install passt, or use network=user."),
+        )
+    };
+    push_doctor_check(
+        &mut checks,
+        "host.network.passt",
+        status,
+        message,
+        hint,
+        Some(json!({"qemu_backend": passt_backend})),
+    );
 
     if env::consts::OS == "linux" {
         let kvm = Path::new("/dev/kvm");
@@ -1236,6 +1420,41 @@ fn doctor(dirs: &Dirs, name: Option<&str>, output: OutputFormat) -> Result<()> {
             ),
             Some(vm_qemu_capabilities.clone()),
         );
+        if vm.config.network.eq_ignore_ascii_case("passt") {
+            let qemu_passt = vm_qemu_capabilities["network_backends"]
+                .as_array()
+                .is_some_and(|backends| backends.iter().any(|backend| backend == "passt"));
+            let passt_path = find_command("passt");
+            let (status, message, hint) = if env::consts::OS != "linux" {
+                (
+                    "error",
+                    "network=passt is currently supported only on Linux hosts".to_string(),
+                    Some("Set network=user or run this VM on a Linux host."),
+                )
+            } else if !qemu_passt {
+                (
+                    "error",
+                    format!("{vm_qemu_binary} does not support network=passt"),
+                    Some("Install QEMU 10.1 or newer, or set network=user."),
+                )
+            } else if let Some(path) = passt_path {
+                ("ok", format!("network=passt can use {path}"), None)
+            } else {
+                (
+                    "error",
+                    "network=passt requires the passt executable".to_string(),
+                    Some("Install passt, or set network=user."),
+                )
+            };
+            push_doctor_check(
+                &mut checks,
+                "vm.network.passt",
+                status,
+                message,
+                hint,
+                Some(json!({"qemu_backend": qemu_passt})),
+            );
+        }
         let vm_runtime_failures = vm_qemu_capabilities["runtime_probe_failures"]
             .as_array()
             .is_some_and(|values| !values.is_empty());
@@ -2373,9 +2592,21 @@ fn launch_viewer(vm: &Vm, plan: &qemu::QemuPlan, quiet: bool) -> bool {
     {
         return false;
     }
-    let mut command = ProcessCommand::new(&vm.config.viewer);
-    if let Some(port) = plan.spice_port {
-        if vm.config.viewer == "spicy" {
+    match start_viewer(vm, &vm.config.viewer, plan.spice_port) {
+        Ok(()) => true,
+        Err(error) => {
+            if !quiet {
+                eprintln!("vmctl: {error}");
+            }
+            false
+        }
+    }
+}
+
+fn start_viewer(vm: &Vm, viewer: &str, port: Option<u16>) -> Result<()> {
+    let mut command = ProcessCommand::new(viewer);
+    if let Some(port) = port {
+        if viewer == "spicy" {
             if spice_address(&vm.config) == "127.0.0.1" {
                 command.args(["--port", &port.to_string()]);
             } else {
@@ -2391,7 +2622,7 @@ fn launch_viewer(vm: &Vm, plan: &qemu::QemuPlan, quiet: bool) -> bool {
         }
     } else {
         let uri = format!("spice+unix://{}", vm.paths.spice_socket().display());
-        if vm.config.viewer == "spicy" {
+        if viewer == "spicy" {
             command.arg(format!("--uri={uri}"));
         } else {
             command.arg(uri);
@@ -2403,18 +2634,9 @@ fn launch_viewer(vm: &Vm, plan: &qemu::QemuPlan, quiet: bool) -> bool {
         .args(&vm.config.viewer_extra_args)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    match command.spawn() {
-        Ok(_) => true,
-        Err(error) => {
-            if !quiet {
-                eprintln!(
-                    "vmctl: viewer `{}` was not started: {error}",
-                    vm.config.viewer
-                );
-            }
-            false
-        }
-    }
+    command.spawn().map(|_| ()).map_err(|error| {
+        Error::message(format!("SPICE viewer `{viewer}` was not started: {error}"))
+    })
 }
 
 fn reconnect_viewer(vm: &Vm, quiet: bool) -> bool {
@@ -2531,7 +2753,7 @@ fn cli_path(path: &Path) -> Result<PathBuf> {
 mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
-    use clap_complete::{Shell, generate};
+    use std::net::TcpListener;
 
     #[test]
     fn command_line_parsing_keeps_vm_names_and_options() {
@@ -2579,6 +2801,28 @@ mod tests {
     }
 
     #[test]
+    fn command_line_parses_ssh_readiness_wait() {
+        let cli = Cli::try_parse_from([
+            "vmctl",
+            "start",
+            "ubuntu",
+            "--wait",
+            "ssh",
+            "--wait-timeout",
+            "3",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(VmCommand::Start {
+                wait: Some(StartWait::Ssh),
+                wait_timeout: 3,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn command_line_parses_gtk_clipboard_option() {
         let cli = Cli::try_parse_from(["vmctl", "start", "ubuntu", "--clipboard"]).unwrap();
         assert!(matches!(
@@ -2597,6 +2841,15 @@ mod tests {
     }
 
     #[test]
+    fn command_line_parses_viewer_override() {
+        let cli = Cli::try_parse_from(["vmctl", "view", "freebsd", "--viewer", "spicy"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(VmCommand::View { vm, viewer }) if vm == "freebsd" && viewer.as_deref() == Some("spicy")
+        ));
+    }
+
+    #[test]
     fn vm_ssh_does_not_persist_host_keys() {
         let options = vm_ssh_options();
         let null_device = if cfg!(windows) { "NUL" } else { "/dev/null" };
@@ -2606,13 +2859,16 @@ mod tests {
     }
 
     #[test]
-    fn generates_bash_completions() {
-        let mut command = Cli::command();
-        let mut output = Vec::new();
-        generate(Shell::Bash, &mut command, "vmctl", &mut output);
-        let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("vmctl"));
-        assert!(output.contains("completion"));
+    fn ssh_readiness_requires_an_ssh_banner() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.write_all(b"SSH-2.0-vmctl-test\r\n").unwrap();
+        });
+
+        assert!(has_ssh_banner(address, Duration::from_secs(1)));
+        server.join().unwrap();
     }
 
     #[test]

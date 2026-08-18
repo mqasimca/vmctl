@@ -1,4 +1,5 @@
-use clap::{Parser, error::ErrorKind};
+use clap::{CommandFactory, Parser, error::ErrorKind};
+use clap_complete::CompleteEnv;
 
 use vmctl::cli::OutputFormat;
 
@@ -13,6 +14,10 @@ fn configure_sigpipe() {
 fn main() -> std::process::ExitCode {
     #[cfg(unix)]
     configure_sigpipe();
+
+    CompleteEnv::with_factory(vmctl::cli::Cli::command)
+        .var("VMCTL_COMPLETE")
+        .complete();
 
     let cli = match vmctl::cli::Cli::try_parse() {
         Ok(cli) => cli,

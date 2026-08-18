@@ -10,10 +10,12 @@ vmctl status VM                    # inspect one VM and its runtime state
 vmctl plan VM --output json        # inspect the exact QEMU invocation
 vmctl plan VM --output json --redact # omit sensitive inline values
 vmctl start VM                     # create missing disk/EFI state and start
+vmctl start VM --wait ssh          # start and wait for the guest SSH banner
 vmctl start VM --ssh-access remote # explicitly expose SSH beyond localhost
 vmctl start VM --clipboard         # enable GTK host-guest clipboard sharing
 vmctl start VM --viewer-extra-args --foo value
 vmctl ssh VM --user USER            # connect through the active SSH forward
+vmctl view VM                        # open a SPICE console for a running VM
 vmctl stop VM [--force]            # graceful QMP shutdown, then optional kill
 vmctl kill VM                      # immediately terminate a running VM
 vmctl restart VM [--force]         # stop, then start again
@@ -64,7 +66,7 @@ sudo apt install -y \
   qemu-system-modules-spice qemu-system-modules-opengl \
   ovmf qemu-efi-aarch64 \
   virt-viewer spice-client-gtk \
-  swtpm virtiofsd samba usbutils xdg-user-dirs \
+  swtpm virtiofsd samba usbutils xdg-user-dirs passt \
   gzip bzip2 unzip 7zip xorriso
 ```
 
@@ -90,7 +92,7 @@ sudo apt install -y \
   qemu-system-x86 qemu-system-arm qemu-utils qemu-system-gui \
   ovmf qemu-efi-aarch64 \
   virt-viewer spice-client-gtk \
-  swtpm samba usbutils xdg-user-dirs \
+  swtpm samba usbutils xdg-user-dirs passt \
   gzip bzip2 unzip 7zip xorriso
 ```
 
@@ -105,10 +107,43 @@ sudo pacman -Syu --needed \
   ca-certificates curl coreutils openssh procps-ng util-linux \
   qemu-full edk2-ovmf edk2-aarch64 \
   virt-viewer spice-gtk \
-  swtpm virtiofsd samba usbutils xdg-user-dirs \
+  swtpm virtiofsd samba usbutils xdg-user-dirs passt \
   gzip bzip2 unzip 7zip cdrtools libisoburn
 rustup default stable
 ```
+
+### Fedora 43+
+
+```bash
+sudo dnf install -y \
+  @development-tools rustup \
+  ca-certificates curl coreutils openssh-clients procps-ng util-linux \
+  qemu-system-x86 qemu-system-aarch64 qemu-img \
+  qemu-ui-gtk qemu-ui-sdl qemu-ui-opengl qemu-ui-spice-core qemu-ui-spice-app \
+  edk2-ovmf edk2-aarch64 \
+  virt-viewer spice-gtk \
+  swtpm virtiofsd samba usbutils xdg-user-dirs passt \
+  gzip bzip2 unzip 7zip xorriso
+rustup default stable
+```
+
+### openSUSE Tumbleweed
+
+```bash
+sudo zypper install -y \
+  gcc make pkg-config rustup \
+  ca-certificates curl coreutils openssh procps util-linux \
+  qemu qemu-arm qemu-utils qemu-ovmf-x86_64 qemu-uefi-aarch64 \
+  virt-viewer spice-gtk \
+  swtpm virtiofsd samba usbutils xdg-user-dirs passt \
+  gzip bzip2 unzip 7zip xorriso
+rustup default stable
+```
+
+`network=passt` needs both QEMU 10.1 or newer and the `passt` executable.
+Fedora 43+ and Tumbleweed package both. On a distribution or QEMU build that
+does not meet those requirements, keep the default `network=user`; `vmctl
+doctor` reports the exact missing prerequisite.
 
 On Linux, add your user to the `kvm` group when `/dev/kvm` exists, then log
 out and back in:
@@ -143,10 +178,19 @@ does not exit or enter its `shutdown` state before the deadline.
 
 `vmctl ssh VM` opens OpenSSH on the VM's active forwarded port; use
 `--user USER` (or `-l USER`) when the guest login differs from the host user.
-It requires a running VM with user-mode networking and an SSH service inside
-the guest. It does not read or write known-host files, so rebuilt VMs do not
+It requires a running VM with `network=user` or `network=passt` and an SSH
+service inside the guest. Use `vmctl start VM --wait ssh` to wait up to 120
+seconds for the guest SSH banner; override that with `--wait-timeout SECONDS`.
+It does not read or write known-host files, so rebuilt VMs do not
 cause stale-key conflicts. This means the VM host key is not authenticated;
 use plain `ssh` with its explicit port when host-key verification is required.
+
+`network=passt` is an opt-in, unprivileged Linux alternative to the default
+user-mode network. It gives the guest current host networking, including IPv6,
+while vmctl forwards only its SSH port and configured `port_forwards`. QEMU
+starts `passt`; do not start a separate daemon. A `passt` VM cannot use the
+QEMU SMB share for Windows guests, so use `network=user` when that share is
+needed.
 
 `qemu-bridge-helper` is supplied by the QEMU packages; bridged networking may
 also require a permitted host bridge. `vmctl doctor VM` verifies that a configured
@@ -201,6 +245,8 @@ vmctl completion fish > ~/.config/fish/completions/vmctl.fish
 
 `vmctl completion --help` lists every supported shell, including PowerShell
 and Elvish. The command only writes the completion script to standard output.
+The generated script queries vmctl at tab time, so VM-name suggestions stay
+current and honor `--dir PATH`. Regenerate the script after upgrading vmctl.
 
 Use `--dir PATH` for the directory containing `.conf` files and `--state-dir
 PATH` for runtime state. `--output json` is available on command paths that
@@ -324,8 +370,9 @@ IPC reachability, and the bounded tail of `qemu.log`. Its JSON result has a stab
 hints.
 
 `report --output json` includes separate x86_64 and aarch64 QEMU capability
-matrices: compiled and runtime accelerators, display backends, optional device
-support candidates, CPU models, and probe completeness. `plan` and `start` validate the
+matrices: compiled and runtime accelerators, display and network backends,
+optional device support candidates, CPU models, and probe completeness. `doctor`
+reports the `host.network.passt` and `vm.network.passt` prerequisites. `plan` and `start` validate the
 selected CPU model/features and display backend before launching QEMU; when
 hardware acceleration is unavailable, the plan reports the TCG fallback.
 

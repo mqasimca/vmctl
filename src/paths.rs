@@ -116,7 +116,7 @@ pub fn home_dir() -> Result<PathBuf> {
     path.ok_or(Error::HomeDirectoryUnavailable)
 }
 
-fn default_vm_dir() -> Result<PathBuf> {
+pub(crate) fn default_vm_dir() -> Result<PathBuf> {
     Ok(platform_roots()?.0.join("vmctl").join("vms"))
 }
 

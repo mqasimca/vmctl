@@ -1,12 +1,23 @@
-use std::path::PathBuf;
+use std::ffi::{OsStr, OsString};
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use clap_complete::Shell;
+use clap_complete::{
+    Shell,
+    engine::{ArgValueCompleter, CompletionCandidate},
+};
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 pub enum OutputFormat {
     Human,
     Json,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum StartWait {
+    /// Wait until the guest SSH service accepts connections.
+    Ssh,
 }
 
 #[derive(Debug, Parser)]
@@ -57,13 +68,13 @@ pub enum Command {
 
     /// Show one VM in detail, or list all VMs when no name is given.
     Status {
-        #[arg(value_name = "VM")]
+        #[arg(value_name = "VM", add = ArgValueCompleter::new(complete_vm_names))]
         vm: Option<String>,
     },
 
     /// Print the QEMU command that would be executed.
     Plan {
-        #[arg(value_name = "VM")]
+        #[arg(value_name = "VM", add = ArgValueCompleter::new(complete_vm_names))]
         vm: String,
         /// Redact common secret values in plan output.
         #[arg(long)]
@@ -74,24 +85,44 @@ pub enum Command {
 
     /// Start a VM with QEMU.
     Start {
-        #[arg(value_name = "VM")]
+        #[arg(value_name = "VM", add = ArgValueCompleter::new(complete_vm_names))]
         vm: String,
+        /// Wait for a guest service after QEMU starts.
+        #[arg(long, value_enum, value_name = "READY")]
+        wait: Option<StartWait>,
+        /// Maximum seconds to wait for --wait (default: 120).
+        #[arg(
+            long,
+            default_value_t = 120,
+            value_parser = clap::value_parser!(u64).range(1..=86_400)
+        )]
+        wait_timeout: u64,
         #[command(flatten)]
         options: LaunchOptions,
     },
 
     /// Open an SSH session through a running VM's forwarded port.
     Ssh {
-        #[arg(value_name = "VM")]
+        #[arg(value_name = "VM", add = ArgValueCompleter::new(complete_vm_names))]
         vm: String,
         /// Guest login name (defaults to the current host user).
         #[arg(short = 'l', long, value_name = "USER")]
         user: Option<String>,
     },
 
+    /// Open a graphical SPICE console for a running VM.
+    #[command(visible_alias = "connect")]
+    View {
+        #[arg(value_name = "VM", add = ArgValueCompleter::new(complete_vm_names))]
+        vm: String,
+        /// SPICE viewer command (defaults to the VM setting or remote-viewer).
+        #[arg(long, value_name = "COMMAND")]
+        viewer: Option<String>,
+    },
+
     /// Request a graceful guest shutdown through QMP.
     Stop {
-        #[arg(value_name = "VM")]
+        #[arg(value_name = "VM", add = ArgValueCompleter::new(complete_vm_names))]
         vm: String,
         /// Wait up to this many seconds for the process to exit.
         #[arg(
@@ -107,13 +138,13 @@ pub enum Command {
 
     /// Immediately terminate a running VM process.
     Kill {
-        #[arg(value_name = "VM")]
+        #[arg(value_name = "VM", add = ArgValueCompleter::new(complete_vm_names))]
         vm: String,
     },
 
     /// Show the tail of a VM's QEMU log.
     Logs {
-        #[arg(value_name = "VM")]
+        #[arg(value_name = "VM", add = ArgValueCompleter::new(complete_vm_names))]
         vm: String,
         /// Number of log lines to return.
         #[arg(
@@ -126,7 +157,7 @@ pub enum Command {
 
     /// Stop and start a VM.
     Restart {
-        #[arg(value_name = "VM")]
+        #[arg(value_name = "VM", add = ArgValueCompleter::new(complete_vm_names))]
         vm: String,
         /// Wait up to this many seconds for graceful shutdown.
         #[arg(
@@ -144,7 +175,7 @@ pub enum Command {
 
     /// Manage an internal QEMU disk snapshot.
     Snapshot {
-        #[arg(value_name = "VM")]
+        #[arg(value_name = "VM", add = ArgValueCompleter::new(complete_vm_names))]
         vm: String,
         #[command(subcommand)]
         action: SnapshotAction,
@@ -152,7 +183,7 @@ pub enum Command {
 
     /// Inspect and manage a VM disk image.
     Disk {
-        #[arg(value_name = "VM")]
+        #[arg(value_name = "VM", add = ArgValueCompleter::new(complete_vm_names))]
         vm: String,
         #[command(subcommand)]
         action: DiskAction,
@@ -161,7 +192,7 @@ pub enum Command {
     /// Delete a VM disk and its persistent UEFI variables.
     #[command(visible_alias = "delete")]
     DeleteDisk {
-        #[arg(value_name = "VM")]
+        #[arg(value_name = "VM", add = ArgValueCompleter::new(complete_vm_names))]
         vm: String,
         /// Confirm deletion without an interactive prompt.
         #[arg(long)]
@@ -170,7 +201,7 @@ pub enum Command {
 
     /// Delete a VM configuration, disk, and runtime data.
     DeleteVm {
-        #[arg(value_name = "VM")]
+        #[arg(value_name = "VM", add = ArgValueCompleter::new(complete_vm_names))]
         vm: String,
         /// Confirm deletion without an interactive prompt.
         #[arg(long)]
@@ -179,7 +210,7 @@ pub enum Command {
 
     /// Send an HMP command to the legacy QEMU monitor.
     Monitor {
-        #[arg(value_name = "VM")]
+        #[arg(value_name = "VM", add = ArgValueCompleter::new(complete_vm_names))]
         vm: String,
         #[arg(value_name = "COMMAND", trailing_var_arg = true)]
         command: Vec<String>,
@@ -187,7 +218,7 @@ pub enum Command {
 
     /// Run a command through the QEMU Guest Agent.
     Guest {
-        #[arg(value_name = "VM")]
+        #[arg(value_name = "VM", add = ArgValueCompleter::new(complete_vm_names))]
         vm: String,
         #[command(subcommand)]
         action: GuestAction,
@@ -195,7 +226,7 @@ pub enum Command {
 
     /// Create a desktop launcher for a VM.
     Shortcut {
-        #[arg(value_name = "VM")]
+        #[arg(value_name = "VM", add = ArgValueCompleter::new(complete_vm_names))]
         vm: String,
         /// Write the launcher to this path instead of the desktop applications directory.
         #[arg(long, value_name = "PATH")]
@@ -207,7 +238,7 @@ pub enum Command {
 
     /// Check host and optional VM readiness without changing state.
     Doctor {
-        #[arg(value_name = "VM")]
+        #[arg(value_name = "VM", add = ArgValueCompleter::new(complete_vm_names))]
         vm: Option<String>,
     },
 
@@ -219,6 +250,101 @@ pub enum Command {
 
     /// Download OS images and create VM configurations.
     Get(GetArgs),
+}
+
+fn complete_vm_names(current: &OsStr) -> Vec<CompletionCandidate> {
+    vm_name_candidates(&completion_vm_dir(), current)
+}
+
+fn completion_vm_dir() -> PathBuf {
+    let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    completion_vm_dir_from_args(&args)
+        .unwrap_or_else(|| crate::paths::default_vm_dir().unwrap_or_default())
+}
+
+fn completion_vm_dir_from_args(args: &[OsString]) -> Option<PathBuf> {
+    let args = args
+        .iter()
+        .position(|arg| arg == "--")
+        .map_or(args, |index| &args[index + 1..]);
+    let mut dir = None;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if arg == "-d" || arg == "--dir" || arg == "--vm-dir" {
+            dir = args.next().cloned().map(PathBuf::from);
+        } else if let Some(value) = arg.to_str().and_then(|arg| {
+            arg.strip_prefix("--dir=")
+                .or_else(|| arg.strip_prefix("--vm-dir="))
+        }) {
+            dir = Some(PathBuf::from(value));
+        } else if let Some(value) = arg
+            .to_str()
+            .and_then(|arg| arg.strip_prefix("-d").filter(|value| !value.is_empty()))
+        {
+            dir = Some(PathBuf::from(value));
+        }
+    }
+    dir
+}
+
+fn vm_name_candidates(dir: &Path, current: &OsStr) -> Vec<CompletionCandidate> {
+    let Some(current) = current.to_str() else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut names = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension == "conf")
+            {
+                path.file_stem().and_then(OsStr::to_str).map(str::to_string)
+            } else {
+                None
+            }
+        })
+        .filter(|name| name.starts_with(current))
+        .collect::<Vec<_>>();
+    names.sort();
+    names.into_iter().map(CompletionCandidate::new).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vm_name_completion_lists_matching_config_stems() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("alpha.conf"), []).unwrap();
+        fs::write(root.path().join("beta.conf"), []).unwrap();
+        fs::write(root.path().join("ignored.txt"), []).unwrap();
+
+        let candidates = vm_name_candidates(root.path(), OsStr::new("a"));
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].get_value(), OsStr::new("alpha"));
+    }
+
+    #[test]
+    fn vm_name_completion_honors_dir_arguments() {
+        let args = [
+            OsString::from("--"),
+            OsString::from("vmctl"),
+            OsString::from("start"),
+            OsString::from("--dir"),
+            OsString::from("/tmp/vmctl-vms"),
+            OsString::new(),
+        ];
+        assert_eq!(
+            completion_vm_dir_from_args(&args),
+            Some(PathBuf::from("/tmp/vmctl-vms"))
+        );
+    }
 }
 
 #[derive(Debug, Clone, Subcommand)]

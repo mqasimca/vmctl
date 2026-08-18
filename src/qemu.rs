@@ -592,7 +592,27 @@ impl QemuPlanContext {
         let username = env::var("USER")
             .or_else(|_| env::var("USERNAME"))
             .unwrap_or_else(|_| "user".to_string());
-        let ssh_port = if uses_user_network(config) {
+        if uses_passt_network(config) {
+            if host_os != "linux" {
+                return Err(Error::message(
+                    "network=passt is currently supported only on Linux hosts",
+                ));
+            }
+            let netdevs = qemu_netdev_backends_probe(&qemu_binary).ok_or_else(|| {
+                Error::message("could not query QEMU network backend capabilities")
+            })?;
+            if !netdevs.iter().any(|backend| backend == "passt") {
+                return Err(Error::message(
+                    "network=passt requires QEMU 10.1 or newer with the passt network backend",
+                ));
+            }
+            if find_executable("passt").is_none() {
+                return Err(Error::message(
+                    "network=passt requires the passt executable; install passt and retry",
+                ));
+            }
+        }
+        let ssh_port = if uses_port_forwarding_network(config) {
             Some(match config.ssh_port {
                 Some(port) => port,
                 None => find_free_port(22220)?,
@@ -1956,6 +1976,51 @@ fn add_network_args(
         return Ok(());
     }
 
+    if uses_passt_network(&vm.config) {
+        if smbd
+            && matches!(vm.config.guest_os.as_str(), "windows" | "windows-server")
+            && vm
+                .config
+                .public_dir
+                .as_ref()
+                .is_some_and(|path| path.is_dir())
+        {
+            return Err(Error::message(
+                "Windows SMB sharing requires network=user; passt does not provide QEMU's SMB server",
+            ));
+        }
+        let tcp_ports = vm
+            .config
+            .port_forwards
+            .iter()
+            .map(|(host, guest)| format!("{host}:{guest}"))
+            .collect::<Vec<_>>();
+        let mac = vm
+            .config
+            .macaddr
+            .as_deref()
+            .map_or_else(String::new, |mac| format!(",mac={mac}"));
+        let mut net = "passt,id=nic,tcp-ports=none,udp-ports=none".to_string();
+        if let Some(port) = ssh_port {
+            net.push_str(&format!(
+                ",param=--tcp-ports={}/{port}:22",
+                ssh_address(&vm.config)
+            ));
+        }
+        if !tcp_ports.is_empty() {
+            let ports = tcp_ports.join(",,");
+            net.push_str(&format!(",param=--tcp-ports=127.0.0.1/{ports}"));
+            net.push_str(&format!(",param=--udp-ports=127.0.0.1/{ports}"));
+        }
+        args.extend([
+            "-device".to_string(),
+            format!("{net_device},netdev=nic{mac}"),
+            "-netdev".to_string(),
+            net,
+        ]);
+        return Ok(());
+    }
+
     let mut net = format!("user,id=nic,hostname={}", vm.config.name);
     if vm.config.network.eq_ignore_ascii_case("restrict") {
         net.push_str(",restrict=on");
@@ -2129,7 +2194,8 @@ pub(crate) fn configured_bridge(config: &VmConfig) -> Option<&str> {
     config.bridge.as_deref().or_else(|| {
         (!config.network.is_empty()
             && !config.network.eq_ignore_ascii_case("restrict")
-            && !config.network.eq_ignore_ascii_case("user"))
+            && !config.network.eq_ignore_ascii_case("user")
+            && !uses_passt_network(config))
         .then_some(config.network.as_str())
     })
 }
@@ -2140,6 +2206,14 @@ fn uses_user_network(config: &VmConfig) -> bool {
         && (config.network.is_empty()
             || config.network.eq_ignore_ascii_case("restrict")
             || config.network.eq_ignore_ascii_case("user"))
+}
+
+fn uses_passt_network(config: &VmConfig) -> bool {
+    !config.offline && config.network.eq_ignore_ascii_case("passt")
+}
+
+fn uses_port_forwarding_network(config: &VmConfig) -> bool {
+    uses_user_network(config) || uses_passt_network(config)
 }
 
 pub fn ensure_disk(vm: &Vm) -> Result<()> {
@@ -5056,6 +5130,43 @@ fn qemu_display_backends_from_text(text: &str) -> Vec<String> {
     backends
 }
 
+fn qemu_netdev_backends_probe(binary: &str) -> Option<Vec<String>> {
+    qemu_help_output(binary, qemu_netdev_help_args(binary))
+        .map(|text| qemu_netdev_backends_from_text(&text))
+}
+
+fn qemu_netdev_help_args(binary: &str) -> &[&str] {
+    if binary.contains("aarch64") {
+        &["-machine", "virt", "-netdev", "help"][..]
+    } else {
+        &["-netdev", "help"][..]
+    }
+}
+
+fn qemu_netdev_backends_from_text(text: &str) -> Vec<String> {
+    let mut backends = Vec::new();
+    let mut in_section = false;
+    for line in text.lines() {
+        if line.contains("Available netdev backend types:") {
+            in_section = true;
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        let value = line.trim();
+        if value.is_empty() || value.starts_with("Some ") {
+            break;
+        }
+        if value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '-' || character == '_'
+        }) {
+            backends.push(value.to_string());
+        }
+    }
+    backends
+}
+
 pub(crate) fn qemu_capability_report(binary: &str) -> Value {
     let version = qemu_help_output(binary, &["-version"]).and_then(|text| {
         qemu_version(text.as_bytes())
@@ -5076,6 +5187,7 @@ pub(crate) fn qemu_capability_report(binary: &str) -> Value {
             "runtime_unprobed": [],
             "runtime_complete": false,
             "display_backends": [],
+            "network_backends": [],
             "devices": {},
             "cpu_models": {},
         });
@@ -5084,6 +5196,7 @@ pub(crate) fn qemu_capability_report(binary: &str) -> Value {
     let display = display_probe
         .as_deref()
         .map_or_else(Vec::new, qemu_display_backends_from_text);
+    let network_backends = qemu_netdev_backends_probe(binary);
     let accelerator_probe = qemu_help_output(binary, &["-accel", "help"]);
     let accelerators = accelerator_probe
         .as_deref()
@@ -5096,6 +5209,7 @@ pub(crate) fn qemu_capability_report(binary: &str) -> Value {
         .map_or_else(Vec::new, qemu_quoted_names);
     let cpu_probe = qemu_help_output(binary, &["-cpu", "help"]);
     let complete = display_probe.is_some()
+        && network_backends.is_some()
         && accelerator_probe.is_some()
         && device_probe.is_some()
         && cpu_probe.is_some();
@@ -5133,6 +5247,7 @@ pub(crate) fn qemu_capability_report(binary: &str) -> Value {
         .collect::<serde_json::Map<_, _>>();
     let failed_probes = [
         ("display", display_probe.is_none()),
+        ("network", network_backends.is_none()),
         ("accelerator", accelerator_probe.is_none()),
         ("device", device_probe.is_none()),
         ("cpu", cpu_probe.is_none()),
@@ -5155,6 +5270,7 @@ pub(crate) fn qemu_capability_report(binary: &str) -> Value {
             && runtime_probe_failures.is_empty()
             && runtime_unprobed.is_empty(),
         "display_backends": display,
+        "network_backends": network_backends.unwrap_or_default(),
         "devices": device_support,
         "cpu_models": cpu_models,
     })
@@ -6045,6 +6161,47 @@ mod tests {
     }
 
     #[test]
+    fn passt_network_scopes_forwarded_ports() {
+        let root = tempdir().unwrap();
+        let config_path = root.path().join("passt-network.conf");
+        fs::write(
+            &config_path,
+            "boot=legacy\ndisplay=none\nnetwork=passt\nssh_access=remote\nport_forwards=(\"8080:80\" \"8443:443\")\npublic_dir=none\n",
+        )
+        .unwrap();
+        let vm = load_vm(root.path(), root.path(), config_path).unwrap();
+        let host = QemuPlanContext {
+            qemu_binary: "qemu-system-x86_64".to_string(),
+            host_os: "linux".to_string(),
+            accelerator: "tcg".to_string(),
+            cpu_cores: 2,
+            ram: "4G".to_string(),
+            virtio_vga_gl: false,
+            usb_redirection: false,
+            smartcard: false,
+            smbd: false,
+            audio_driver: None,
+            username: "tester".to_string(),
+            bridge_helper: None,
+            virtiofsd: None,
+            virtiofs_device: false,
+            ssh_port: Some(22444),
+            spice_port: Some(5930),
+        };
+
+        let plan = build_plan(&vm, &host, false).unwrap();
+
+        assert!(uses_passt_network(&vm.config));
+        assert_eq!(configured_bridge(&vm.config), None);
+        assert_eq!(plan.ssh_port, Some(22444));
+        assert!(plan.args.windows(2).any(|args| {
+            args[0] == "-netdev"
+                && args[1]
+                    == "passt,id=nic,tcp-ports=none,udp-ports=none,param=--tcp-ports=0.0.0.0/22444:22,param=--tcp-ports=127.0.0.1/8080:80,,8443:443,param=--udp-ports=127.0.0.1/8080:80,,8443:443"
+        }));
+    }
+
+    #[test]
     fn bridge_plan_includes_the_detected_qemu_helper() {
         let root = tempdir().unwrap();
         let config_path = root.path().join("bridge.conf");
@@ -6352,6 +6509,15 @@ mod tests {
         let accelerators =
             qemu_accelerators_from_text("Accelerators supported in QEMU binary:\ntcg\nkvm\n\n");
         assert_eq!(accelerators, ["tcg", "kvm"]);
+
+        let netdevs = qemu_netdev_backends_from_text(
+            "Available netdev backend types:\nsocket\npasst\nuser\n\n",
+        );
+        assert_eq!(netdevs, ["socket", "passt", "user"]);
+        assert_eq!(
+            qemu_netdev_help_args("qemu-system-aarch64"),
+            ["-machine", "virt", "-netdev", "help"]
+        );
     }
 
     #[test]
