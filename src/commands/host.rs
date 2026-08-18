@@ -1,0 +1,174 @@
+use super::*;
+
+pub(super) fn host_action(action: HostAction, output: OutputFormat) -> Result<()> {
+    match action {
+        HostAction::IgnoreMsrsAlways => configure_ignore_msrs(output, true),
+    }
+}
+
+pub(super) fn configure_ignore_msrs(output: OutputFormat, report: bool) -> Result<()> {
+    if env::consts::OS != "linux" {
+        return Err(Error::message(
+            "persistent KVM MSR settings are only supported on Linux",
+        ));
+    }
+    let path = Path::new("/etc/modprobe.d/vmctl-kvm.conf");
+    if path
+        .symlink_metadata()
+        .ok()
+        .is_some_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(Error::message(format!(
+            "refusing to write through symlink {}",
+            path.display()
+        )));
+    }
+    let existing = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(Error::io(path.display(), error)),
+    };
+    let setting = "options kvm ignore_msrs=Y";
+    let already_configured = existing.lines().any(|line| line.trim() == setting);
+    let used_sudo = if already_configured {
+        false
+    } else {
+        let contents = if existing.is_empty() {
+            format!("{setting}\n")
+        } else {
+            format!("{}\n{setting}\n", existing.trim_end())
+        };
+        write_host_file(path, &contents)?
+    };
+
+    let initramfs = if already_configured {
+        "already configured"
+    } else if let Some(command) = find_command("update-initramfs") {
+        let mut process = if used_sudo {
+            let mut process = ProcessCommand::new("sudo");
+            process.arg(&command);
+            process
+        } else {
+            ProcessCommand::new(&command)
+        };
+        let status = process
+            .args(["-k", "all", "-u"])
+            .status()
+            .map_err(|error| Error::command_unavailable(&command, error))?;
+        if !status.success() {
+            return Err(Error::command_failed_status(&command, status));
+        }
+        "rebuilt"
+    } else if let Some(command) = find_command("mkinitcpio") {
+        let mut process = if used_sudo {
+            let mut process = ProcessCommand::new("sudo");
+            process.arg(&command);
+            process
+        } else {
+            ProcessCommand::new(&command)
+        };
+        let status = process
+            .arg("-P")
+            .status()
+            .map_err(|error| Error::command_unavailable(&command, error))?;
+        if !status.success() {
+            return Err(Error::command_failed_status(&command, status));
+        }
+        "rebuilt with mkinitcpio"
+    } else {
+        "not available; reboot or rebuild initramfs manually"
+    };
+
+    if !report {
+        return Ok(());
+    }
+    if output == OutputFormat::Json {
+        println!(
+            "{}",
+            json!({
+                "path": path,
+                "configured": true,
+                "initramfs": initramfs,
+            })
+        );
+    } else {
+        println!("Configured {}", path.display());
+        println!("initramfs: {initramfs}");
+    }
+    Ok(())
+}
+
+pub(super) fn write_host_file(path: &Path, contents: &str) -> Result<bool> {
+    match fs::write(path, contents) {
+        Ok(()) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            let mut child = ProcessCommand::new("sudo")
+                .args(["tee", path.to_string_lossy().as_ref()])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .map_err(|error| Error::command_unavailable("sudo", error))?;
+            child
+                .stdin
+                .take()
+                .ok_or_else(|| Error::message("sudo did not provide stdin"))?
+                .write_all(contents.as_bytes())
+                .map_err(|error| Error::io(path.display(), error))?;
+            let status = child
+                .wait()
+                .map_err(|error| Error::command_unavailable("sudo", error))?;
+            if status.success() {
+                Ok(true)
+            } else {
+                Err(Error::command_failed_status("sudo tee", status))
+            }
+        }
+        Err(error) => Err(Error::io(path.display(), error)),
+    }
+}
+
+pub(super) fn find_command(command: &str) -> Option<String> {
+    let path = env::var_os("PATH")?;
+    #[cfg(windows)]
+    let names = {
+        let mut names = vec![command.to_string()];
+        if Path::new(command).extension().is_none() {
+            let extensions =
+                env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+            names.extend(
+                extensions
+                    .split(';')
+                    .filter(|extension| !extension.is_empty())
+                    .map(|extension| format!("{command}{extension}")),
+            );
+        }
+        names
+    };
+    #[cfg(not(windows))]
+    let names = [command.to_string()];
+    env::split_paths(&path).find_map(|directory| {
+        names
+            .iter()
+            .map(|name| directory.join(name))
+            .find(|candidate| is_executable_file(candidate))
+            .map(|candidate| candidate.to_string_lossy().into_owned())
+    })
+}
+
+pub(super) fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
