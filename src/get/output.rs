@@ -2,21 +2,17 @@ use super::*;
 
 pub(super) fn print_image(image: &ResolvedImage, output: OutputFormat, available: Option<bool>) {
     if output == OutputFormat::Json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "os": image.os,
-                "release": image.release,
-                "edition": image.edition,
-                "architecture": image.architecture,
-                "url": image.url,
-                "file_name": image.file_name,
-                "kind": image_kind_name(image.kind),
-                "checksum": image.checksum,
-                "available": available,
-            }))
-            .unwrap_or_default()
-        );
+        crate::print_json_success(json!({
+            "os": image.os,
+            "release": image.release,
+            "edition": image.edition,
+            "architecture": image.architecture,
+            "url": image.url,
+            "file_name": image.file_name,
+            "kind": image_kind_name(image.kind),
+            "checksum": image.checksum,
+            "available": available,
+        }));
     } else if let Some(available) = available {
         println!(
             "{}: {} {}",

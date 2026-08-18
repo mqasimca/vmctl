@@ -25,6 +25,12 @@ pub fn ensure_disk(vm: &Vm) -> Result<()> {
         return Ok(());
     }
 
+    if vm.config.cloud_base_img.is_some() || vm.config.cloud_init_iso.is_some() {
+        return Err(Error::message(format!(
+            "cloud disk {} is missing; recreate the VM with `vmctl get --cloud`",
+            vm.config.disk_img.display()
+        )));
+    }
     if vm.config.iso.is_none()
         && vm.config.fixed_iso.is_none()
         && vm.config.img.is_none()
@@ -61,6 +67,77 @@ pub fn ensure_disk(vm: &Vm) -> Result<()> {
         .map_err(|error| Error::command_unavailable("qemu-img", error))?;
     if !status.success() {
         return Err(Error::command_failed("qemu-img create"));
+    }
+    Ok(())
+}
+
+pub(crate) fn create_cloud_overlay(base: &Path, overlay: &Path, backing: &str) -> Result<()> {
+    require_disk_file(base)?;
+    if fs::symlink_metadata(overlay).is_ok() {
+        return Err(Error::message(format!(
+            "cloud disk already exists: {}",
+            overlay.display()
+        )));
+    }
+    if backing.is_empty()
+        || Path::new(backing).is_absolute()
+        || backing.chars().any(|character| character.is_control())
+    {
+        return Err(Error::message(
+            "cloud backing reference must be a safe relative path",
+        ));
+    }
+    let temporary = overlay.with_extension("qcow2.tmp");
+    if fs::symlink_metadata(&temporary).is_ok() {
+        return Err(Error::message(format!(
+            "temporary cloud disk already exists: {}",
+            temporary.display()
+        )));
+    }
+    let status = Command::new("qemu-img")
+        .args(["create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", backing])
+        .arg(&temporary)
+        .status()
+        .map_err(|error| Error::command_unavailable("qemu-img", error))?;
+    if !status.success() {
+        let _ = fs::remove_file(&temporary);
+        return Err(Error::command_failed_status("qemu-img create", status));
+    }
+    if let Err(error) = fs::rename(&temporary, overlay) {
+        let _ = fs::remove_file(&temporary);
+        return Err(Error::io(overlay.display(), error));
+    }
+    Ok(())
+}
+
+pub(crate) fn create_cloud_copy(base: &Path, disk: &Path) -> Result<()> {
+    require_disk_file(base)?;
+    if fs::symlink_metadata(disk).is_ok() {
+        return Err(Error::message(format!(
+            "cloud disk already exists: {}",
+            disk.display()
+        )));
+    }
+    let temporary = disk.with_extension("qcow2.tmp");
+    if fs::symlink_metadata(&temporary).is_ok() {
+        return Err(Error::message(format!(
+            "temporary cloud disk already exists: {}",
+            temporary.display()
+        )));
+    }
+    let status = Command::new("qemu-img")
+        .args(["convert", "-q", "-f", "qcow2", "-O", "qcow2"])
+        .arg(base)
+        .arg(&temporary)
+        .status()
+        .map_err(|error| Error::command_unavailable("qemu-img", error))?;
+    if !status.success() {
+        let _ = fs::remove_file(&temporary);
+        return Err(Error::command_failed_status("qemu-img convert", status));
+    }
+    if let Err(error) = fs::rename(&temporary, disk) {
+        let _ = fs::remove_file(&temporary);
+        return Err(Error::io(disk.display(), error));
     }
     Ok(())
 }

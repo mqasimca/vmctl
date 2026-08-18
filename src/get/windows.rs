@@ -103,7 +103,7 @@ pub(super) fn windows_workstation_url(release: &str, language: &str) -> Result<S
     )?;
     if links_data.contains("Sentinel marked this request as rejected") {
         return Err(Error::message(
-            "Microsoft rejected the automated Windows download request; download the ISO in a browser and use --create-config VM_NAME IMAGE_PATH_OR_URL",
+            "Microsoft rejected the automated Windows download request; download the ISO in a browser and retry later",
         ));
     }
     let links: Value = serde_json::from_str(&links_data)
@@ -183,7 +183,10 @@ pub(super) fn download_windows(
     }
     let edition = required_edition(find_os(os)?, args.edition_or_language.as_deref())?;
     let image = windows_asset(os, release, edition.as_deref())?;
-    let name = suggested_name(os, release, edition.as_deref(), architecture);
+    let name = args
+        .name
+        .clone()
+        .unwrap_or_else(|| suggested_name(os, release, edition.as_deref(), architecture));
     validate_vm_name(&name)?;
     let root = if create_config {
         dirs.vm_dir.clone()
@@ -204,10 +207,37 @@ pub(super) fn download_windows(
     }
     fs::create_dir_all(&target_dir).map_err(|error| Error::io(target_dir.display(), error))?;
     let file_name = file_name_from_url(&image.0).unwrap_or_else(|| format!("{os}-{release}.iso"));
-    let iso = target_dir.join(file_name);
-    download_file(&image.0, &iso, args.insecure)?;
+    let cached = if create_config {
+        Some(cache_url(
+            &root,
+            &image.0,
+            &file_name,
+            ImageKind::Iso,
+            None,
+            args.insecure,
+            args.refresh_cache,
+        )?)
+    } else {
+        None
+    };
+    let iso = cached
+        .as_ref()
+        .map(|cache| cache.path.clone())
+        .unwrap_or_else(|| target_dir.join(file_name));
+    if !create_config {
+        download_file(&image.0, &iso, args.insecure)?;
+    }
     let (fixed_iso, unattended_iso) = if create_config {
-        let fixed_iso = download_virtio_iso(&target_dir, args.insecure)?;
+        let fixed_iso = cache_url(
+            &root,
+            "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso",
+            "virtio-win.iso",
+            ImageKind::Iso,
+            None,
+            args.insecure,
+            args.refresh_cache,
+        )?
+        .path;
         let unattended_iso = if args.disable_unattended {
             None
         } else {
@@ -248,14 +278,28 @@ pub(super) fn download_windows(
         "unattended_iso": unattended_iso,
         "config": config,
         "unattended": unattended_iso.is_some(),
+        "cache": cached.as_ref().map(|cache| json!({
+            "status": cache.status.as_str(),
+            "object": cache.path,
+            "sha256": cache.sha256,
+        })),
     });
     if output == OutputFormat::Json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&result).unwrap_or_default()
-        );
+        crate::print_json_success(result);
     } else if let Some(config) = config {
-        println!("Downloaded {}", iso.display());
+        if let Some(cache) = &cached {
+            println!(
+                "{} {}",
+                if cache.status == CacheStatus::Hit {
+                    "Using cached"
+                } else {
+                    "Downloaded"
+                },
+                cache.path.display()
+            );
+        } else {
+            println!("Downloaded {}", iso.display());
+        }
         println!("Created {}", config.display());
     } else {
         println!("Downloaded {}", iso.display());
@@ -334,14 +378,6 @@ pub(super) const WINDOWS_UNATTENDED_XML: &str = r#"<?xml version="1.0" encoding=
 "#;
 
 pub(super) fn create_unattended_iso(target_dir: &Path, insecure: bool) -> Result<PathBuf> {
-    let builder = ["mkisofs", "genisoimage", "xorriso"]
-        .into_iter()
-        .find(|command| command_exists(command))
-        .ok_or_else(|| {
-            Error::message(
-                "creating unattended Windows media requires mkisofs, genisoimage, or xorriso",
-            )
-        })?;
     let source_dir = target_dir.join("unattended");
     fs::create_dir_all(&source_dir).map_err(|error| Error::io(source_dir.display(), error))?;
     let xml = source_dir.join("autounattend.xml");
@@ -377,24 +413,9 @@ pub(super) fn create_unattended_iso(target_dir: &Path, insecure: bool) -> Result
             destination.display()
         )));
     }
-    let status = if builder == "xorriso" {
-        Command::new(builder)
-            .args(["-as", "mkisofs", "-quiet", "-J", "-o"])
-            .arg(&destination)
-            .arg(&source_dir)
-            .status()
-    } else {
-        Command::new(builder)
-            .args(["-q", "-J", "-o"])
-            .arg(&destination)
-            .arg(&source_dir)
-            .status()
-    }
-    .map_err(|error| Error::command_unavailable(builder, error))?;
+    let result = create_iso(&source_dir, &destination, None);
     let _ = fs::remove_dir_all(&source_dir);
-    if !status.success() {
-        return Err(Error::command_failed_status(builder, status));
-    }
+    result?;
     Ok(destination)
 }
 

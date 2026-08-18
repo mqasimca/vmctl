@@ -74,6 +74,61 @@ pub(super) fn write_vm_config(
     Ok(config_path)
 }
 
+pub(super) struct CloudVmConfig<'a> {
+    pub(super) os: &'a str,
+    pub(super) release: &'a str,
+    pub(super) architecture: &'a str,
+    pub(super) base: Option<&'a Path>,
+    pub(super) disk: &'a Path,
+    pub(super) seed: &'a Path,
+    pub(super) ssh_user: &'a str,
+}
+
+pub(super) fn write_cloud_vm_config(
+    root: &Path,
+    name: &str,
+    cloud: CloudVmConfig<'_>,
+) -> Result<PathBuf> {
+    let name = validate_vm_name(name)?;
+    let config_path = root.join(format!("{name}.conf"));
+    let relative = |path: &Path| {
+        path.strip_prefix(root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/")
+    };
+    let mut lines = vec![
+        format!(
+            "guest_os=\"{}\"",
+            config_value(guest_os(cloud.os, cloud.release))
+        ),
+        format!(
+            "arch=\"{}\"",
+            config_value(qemu_architecture(cloud.architecture))
+        ),
+        format!("disk_img=\"{}\"", config_value(&relative(cloud.disk))),
+    ];
+    if let Some(base) = cloud.base {
+        lines.push(format!(
+            "cloud_base_img=\"{}\"",
+            config_value(&relative(base))
+        ));
+    }
+    lines.extend([
+        format!("cloud_init_iso=\"{}\"", config_value(&relative(cloud.seed))),
+        format!("ssh_user=\"{}\"", config_value(cloud.ssh_user)),
+    ]);
+    let contents = format!("{}\n", lines.join("\n"));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&config_path)
+        .map_err(|error| Error::io(config_path.display(), error))?;
+    file.write_all(contents.as_bytes())
+        .map_err(|error| Error::io(config_path.display(), error))?;
+    Ok(config_path)
+}
+
 pub(super) fn image_kind(path: &str) -> ImageKind {
     match Path::new(path)
         .extension()
@@ -286,7 +341,7 @@ pub(super) fn file_name_from_url(url: &str) -> Option<String> {
 
 pub(super) fn dynamic_url_error(os: &str) -> Error {
     Error::message(format!(
-        "{os} uses a dynamic provider URL; use --create-config VM_NAME IMAGE_PATH_OR_URL, or choose an OS with a stable URL template"
+        "{os} uses a dynamic provider URL; download it with `vmctl get`, then create a VM from the cached image"
     ))
 }
 

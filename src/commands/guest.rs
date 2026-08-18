@@ -17,9 +17,8 @@ pub(super) fn monitor_vm(
     let command = command.join(" ");
     let response = send_monitor_command(&vm, &command)?;
     if output == OutputFormat::Json {
-        println!(
-            "{}",
-            json!({"name": vm.config.name, "command": command, "response": response})
+        print_json_success(
+            json!({"name": vm.config.name, "command": command, "response": response}),
         );
     } else if !response.is_empty() {
         println!("{response}");
@@ -90,10 +89,7 @@ pub(super) fn guest_vm(
         }
     };
     if output == OutputFormat::Json {
-        println!(
-            "{}",
-            json!({"name": vm.config.name, "command": command, "result": result})
-        );
+        print_json_success(json!({"name": vm.config.name, "command": command, "result": result}));
     } else {
         println!(
             "{}",

@@ -4,10 +4,7 @@ pub(super) fn list_vms(dirs: &Dirs, output: OutputFormat) -> Result<()> {
     let vms = discover(&dirs.vm_dir, &dirs.state_root)?;
     if output == OutputFormat::Json {
         let values: Vec<Value> = vms.iter().map(vm_summary).collect::<Result<_>>()?;
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&values).unwrap_or_default()
-        );
+        print_json_success(json!(values));
         return Ok(());
     }
 
@@ -35,10 +32,7 @@ pub(super) fn status_vms(dirs: &Dirs, name: Option<&str>, output: OutputFormat) 
     if let Some(name) = name {
         let vm = find(&dirs.vm_dir, &dirs.state_root, name)?;
         if output == OutputFormat::Json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&vm_status(&vm)?).unwrap_or_default()
-            );
+            print_json_success(vm_status(&vm)?);
         } else {
             print_vm_status(&vm)?;
         }

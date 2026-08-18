@@ -21,9 +21,8 @@ pub(super) fn snapshot_vm(
     };
     let result = disk_snapshot(&vm, operation, tag.as_deref())?;
     if output == OutputFormat::Json {
-        println!(
-            "{}",
-            json!({"name": vm.config.name, "action": operation, "tag": tag, "result": result})
+        print_json_success(
+            json!({"name": vm.config.name, "action": operation, "tag": tag, "result": result}),
         );
     } else if result.is_empty() {
         println!("Snapshot operation completed for {}", vm.config.name);
@@ -165,10 +164,7 @@ pub(super) fn require_stopped_disk(vm: &Vm, operation: &str) -> Result<()> {
 }
 
 pub(super) fn print_json(value: &Value) {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(value).unwrap_or_default()
-    );
+    print_json_success(value.clone());
 }
 
 pub(super) fn print_disk_info_human(info: &Value) {
@@ -211,7 +207,7 @@ pub(super) fn delete_disk(dirs: &Dirs, name: &str, yes: bool, output: OutputForm
         remove_if_present(&path)?;
     }
     if output == OutputFormat::Json {
-        println!("{}", json!({"name": vm.config.name, "deleted": "disk"}));
+        print_json_success(json!({"name": vm.config.name, "deleted": "disk"}));
     } else {
         println!("Deleted disk data for {}", vm.config.name);
     }
@@ -247,7 +243,7 @@ pub(super) fn delete_vm(dirs: &Dirs, name: &str, yes: bool, output: OutputFormat
             .map_err(|error| Error::io(vm.paths.state_dir.display(), error))?;
     }
     if output == OutputFormat::Json {
-        println!("{}", json!({"name": vm.config.name, "deleted": "vm"}));
+        print_json_success(json!({"name": vm.config.name, "deleted": "vm"}));
     } else {
         println!("Deleted VM {}", vm.config.name);
     }

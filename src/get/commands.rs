@@ -13,6 +13,7 @@ pub(super) enum Operation {
     Download,
     CreateConfig,
     CreateVm,
+    CreateCloudVm,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +50,7 @@ pub fn run(args: &GetArgs, dirs: &Dirs, output: OutputFormat) -> Result<()> {
                 | Operation::Download
                 | Operation::CreateConfig
                 | Operation::CreateVm
+                | Operation::CreateCloudVm
         )
     {
         eprintln!(
@@ -66,7 +68,8 @@ pub fn run(args: &GetArgs, dirs: &Dirs, output: OutputFormat) -> Result<()> {
         Operation::Check { all_architectures } => check_images(&args, all_architectures, output),
         Operation::Download => download_image(&args, dirs, false, output),
         Operation::CreateConfig => create_custom_config(&args, dirs, output),
-        Operation::CreateVm => download_image(&args, dirs, true, output),
+        Operation::CreateVm => download_cached_image(&args, dirs, output),
+        Operation::CreateCloudVm => download_cached_cloud_image(&args, dirs, output),
     }
 }
 
@@ -78,7 +81,11 @@ pub(super) fn validate_operation_arguments(
     if args.arch.is_some()
         && !matches!(
             operation,
-            Operation::Url | Operation::Check { .. } | Operation::Download | Operation::CreateVm
+            Operation::Url
+                | Operation::Check { .. }
+                | Operation::Download
+                | Operation::CreateVm
+                | Operation::CreateCloudVm
         )
     {
         return Err(Error::invalid_argument(
@@ -93,6 +100,7 @@ pub(super) fn validate_operation_arguments(
                 | Operation::Download
                 | Operation::CreateConfig
                 | Operation::CreateVm
+                | Operation::CreateCloudVm
         )
     {
         return Err(Error::invalid_argument(
@@ -106,6 +114,45 @@ pub(super) fn validate_operation_arguments(
         return Err(Error::invalid_argument(
             "--disable-unattended",
             "only VM/config creation operations accept it",
+        ));
+    }
+    if args.refresh_cache
+        && !matches!(
+            operation,
+            Operation::CreateConfig | Operation::CreateVm | Operation::CreateCloudVm
+        )
+    {
+        return Err(Error::invalid_argument(
+            "--refresh-cache",
+            "only VM creation operations accept it",
+        ));
+    }
+    if args.refresh_cache
+        && args
+            .os
+            .as_deref()
+            .is_some_and(|os| os.eq_ignore_ascii_case("macos"))
+    {
+        return Err(Error::invalid_argument(
+            "--refresh-cache",
+            "macOS provisioning manages its own Apple download workflow",
+        ));
+    }
+    if args.cloud
+        && !matches!(
+            operation,
+            Operation::Url | Operation::Check { .. } | Operation::CreateCloudVm
+        )
+    {
+        return Err(Error::invalid_argument(
+            "--cloud",
+            "only cloud URL, check, and VM creation operations accept it",
+        ));
+    }
+    if args.cloud && args.edition_or_language.is_some() {
+        return Err(Error::invalid_argument(
+            "EDITION_OR_LANGUAGE",
+            "cloud images do not accept editions; use OS and RELEASE only",
         ));
     }
     if matches!(
@@ -126,6 +173,10 @@ pub(super) fn validate_operation_arguments(
         )));
     }
     Ok(())
+}
+
+pub(crate) fn create(args: &CreateArgs, dirs: &Dirs, output: OutputFormat) -> Result<()> {
+    create_cached_vm(args, dirs, output)
 }
 
 pub(super) fn select_operation(args: &GetArgs) -> Result<Operation> {
@@ -160,7 +211,11 @@ pub(super) fn select_operation(args: &GetArgs) -> Result<Operation> {
             if args.release_or_input.is_none() && args.edition_or_language.is_none() {
                 Ok(Operation::Show)
             } else {
-                Ok(Operation::CreateVm)
+                Ok(if args.cloud {
+                    Operation::CreateCloudVm
+                } else {
+                    Operation::CreateVm
+                })
             }
         } else {
             Ok(Operation::List)
@@ -206,16 +261,13 @@ pub(super) fn list_csv(output: OutputFormat) -> Result<()> {
 
 pub(super) fn list_json() -> Result<()> {
     let values: Vec<Value> = OS_CATALOG.iter().map(info_json).collect();
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&values).unwrap_or_default()
-    );
+    crate::print_json_success(json!(values));
     Ok(())
 }
 
 pub(super) fn print_version(output: OutputFormat) -> Result<()> {
     if output == OutputFormat::Json {
-        println!("{}", json!({"version": env!("CARGO_PKG_VERSION")}));
+        crate::print_json_success(json!({"version": env!("CARGO_PKG_VERSION")}));
     } else {
         println!("{}", env!("CARGO_PKG_VERSION"));
     }
@@ -243,10 +295,7 @@ pub(super) fn show(args: &GetArgs, output: OutputFormat) -> Result<()> {
         if let Some(releases) = &releases {
             value["releases"] = json!(releases);
         }
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&value).unwrap_or_default()
-        );
+        crate::print_json_success(value);
     } else {
         print_info(&info, releases.as_deref());
         if info.id == "freebsd" {
@@ -356,9 +405,8 @@ pub(super) fn open_homepage(args: &GetArgs, output: OutputFormat) -> Result<()> 
         .spawn()
         .map_err(|error| Error::command_unavailable(command, error))?;
     if output == OutputFormat::Json {
-        println!(
-            "{}",
-            json!({"os": info.id, "homepage": info.homepage, "opened": true})
+        crate::print_json_success(
+            json!({"os": info.id, "homepage": info.homepage, "opened": true}),
         );
     } else {
         println!("Opened {}", info.homepage);
@@ -370,7 +418,8 @@ pub(super) fn print_images(args: &GetArgs, output: OutputFormat) -> Result<()> {
     let os = required_arg(args.os.as_deref(), "OS")?;
     let release = required_arg(args.release_or_input.as_deref(), "RELEASE")?;
     for architecture in requested_architectures(args, os)? {
-        let image = resolve_remote_image(
+        let image = resolve_requested_image(
+            args.cloud,
             os,
             release,
             args.edition_or_language.as_deref(),
@@ -396,7 +445,8 @@ pub(super) fn check_images(
     let mut json_results = Vec::new();
     let mut first_failure: Option<(String, String)> = None;
     for architecture in architectures {
-        let image = match resolve_remote_image(
+        let image = match resolve_requested_image(
+            args.cloud,
             os,
             release,
             args.edition_or_language.as_deref(),
@@ -469,10 +519,7 @@ pub(super) fn check_images(
         return Err(Error::image_unavailable(os, release, &architecture, cause));
     }
     if output == OutputFormat::Json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json_results).unwrap_or_default()
-        );
+        crate::print_json_success(json!(json_results));
     }
     Ok(())
 }

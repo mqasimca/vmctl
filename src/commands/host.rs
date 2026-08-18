@@ -83,14 +83,11 @@ pub(super) fn configure_ignore_msrs(output: OutputFormat, report: bool) -> Resul
         return Ok(());
     }
     if output == OutputFormat::Json {
-        println!(
-            "{}",
-            json!({
-                "path": path,
-                "configured": true,
-                "initramfs": initramfs,
-            })
-        );
+        print_json_success(json!({
+            "path": path,
+            "configured": true,
+            "initramfs": initramfs,
+        }));
     } else {
         println!("Configured {}", path.display());
         println!("initramfs: {initramfs}");

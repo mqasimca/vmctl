@@ -43,8 +43,10 @@ pub(super) fn add_storage_args(args: &mut Vec<String>, vm: &Vm) -> Result<()> {
         return Ok(());
     }
 
-    let has_iso =
-        config.iso.is_some() || config.fixed_iso.is_some() || config.unattended_iso.is_some();
+    let has_iso = config.iso.is_some()
+        || config.fixed_iso.is_some()
+        || config.unattended_iso.is_some()
+        || config.cloud_init_iso.is_some();
     if config.arch == "aarch64" && has_iso {
         args.extend([
             "-device".to_string(),
@@ -71,6 +73,13 @@ pub(super) fn add_storage_args(args: &mut Vec<String>, vm: &Vm) -> Result<()> {
                 "scsi-cd,drive=cd2,bus=scsi0.0,bootindex=4".to_string(),
             ]);
         }
+        if let Some(iso) = &config.cloud_init_iso {
+            add_optional_drive_with_id(args, iso, "cidata", "raw", "media=cdrom,readonly=on")?;
+            args.extend([
+                "-device".to_string(),
+                "scsi-cd,drive=cidata,bus=scsi0.0".to_string(),
+            ]);
+        }
     } else {
         if let Some(iso) = &config.iso {
             let options = if config.guest_os == "reactos" {
@@ -85,6 +94,9 @@ pub(super) fn add_storage_args(args: &mut Vec<String>, vm: &Vm) -> Result<()> {
         }
         if let Some(iso) = &config.unattended_iso {
             add_optional_drive(args, &Some(iso.clone()), "media=cdrom,index=2,readonly=on")?;
+        }
+        if let Some(iso) = &config.cloud_init_iso {
+            add_optional_drive(args, &Some(iso.clone()), "media=cdrom,index=3,readonly=on")?;
         }
     }
     add_optional_drive(args, &config.floppy, "if=floppy,format=raw")?;
@@ -123,7 +135,7 @@ pub(super) fn add_storage_args(args: &mut Vec<String>, vm: &Vm) -> Result<()> {
         args.extend(["-device".to_string(), "ahci,id=ahci".to_string()]);
     }
     let device = match config.guest_os.as_str() {
-        "windows-server" => "ide-hd",
+        "windows" | "windows-server" => "ide-hd",
         "kolibrios" => "ide-hd,bus=ahci.0",
         "macos" => match config.macos_release.as_deref() {
             Some(

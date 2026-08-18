@@ -30,7 +30,7 @@ pub(super) fn ssh_vm(dirs: &Dirs, name: &str, user: Option<&str>) -> Result<()> 
         .args(vm_ssh_options())
         .arg("-p")
         .arg(port.to_string());
-    if let Some(user) = user {
+    if let Some(user) = user.or(vm.config.ssh_user.as_deref()) {
         command.arg("-l").arg(user);
     }
     let status = command
@@ -78,9 +78,8 @@ pub(super) fn view_vm(
         |port| format!("spice://{}:{port}", spice_address(&vm.config)),
     );
     if output == OutputFormat::Json {
-        println!(
-            "{}",
-            json!({ "name": vm.config.name, "viewer": viewer, "endpoint": endpoint })
+        print_json_success(
+            json!({ "name": vm.config.name, "viewer": viewer, "endpoint": endpoint }),
         );
     } else {
         println!("Opened {viewer} for {}", vm.config.name);
@@ -178,16 +177,13 @@ pub(super) fn start_vm_loaded(
             wait_for_ssh_ready(vm, timeout, output)?;
         }
         if output == OutputFormat::Json {
-            println!(
-                "{}",
-                json!({
-                    "name": vm.config.name,
-                    "state": "running",
-                    "pid": pid,
-                    "viewer_reconnected": viewer_reconnected,
-                    "waited_for_ssh": wait_for_ssh.is_some(),
-                })
-            );
+            print_json_success(json!({
+                "name": vm.config.name,
+                "state": "running",
+                "pid": pid,
+                "viewer_reconnected": viewer_reconnected,
+                "waited_for_ssh": wait_for_ssh.is_some(),
+            }));
         } else {
             println!("{} is already running (pid {pid})", vm.config.name);
             if viewer_reconnected {
@@ -333,28 +329,30 @@ pub(super) fn start_vm_loaded(
     }
 
     if output == OutputFormat::Json {
-        println!(
-            "{}",
-            json!({
-                "name": vm.config.name,
-                "state": "running",
-                "pid": pid,
-                "ssh_port": plan.ssh_port,
-                "ssh_host": plan.ssh_host,
-                "spice_port": plan.spice_port,
-                "spice_host": plan.spice_host,
-                "state_dir": vm.paths.state_dir,
-                "log": log_path,
-                "command": vm.paths.state_dir.join("qemu.command"),
-                "viewer_started": viewer_started,
-                "waited_for_ssh": wait_for_ssh.is_some(),
-            })
-        );
+        print_json_success(json!({
+            "name": vm.config.name,
+            "state": "running",
+            "pid": pid,
+            "ssh_port": plan.ssh_port,
+            "ssh_host": plan.ssh_host,
+            "ssh_user": vm.config.ssh_user,
+            "spice_port": plan.spice_port,
+            "spice_host": plan.spice_host,
+            "state_dir": vm.paths.state_dir,
+            "log": log_path,
+            "command": vm.paths.state_dir.join("qemu.command"),
+            "viewer_started": viewer_started,
+            "waited_for_ssh": wait_for_ssh.is_some(),
+        }));
     } else {
         println!("Started {} (pid {pid})", vm.config.name);
         println!("  log:   {}", log_path.display());
         if let Some(port) = plan.ssh_port {
-            let user = env::var("USER").unwrap_or_else(|_| "user".to_string());
+            let user = vm
+                .config
+                .ssh_user
+                .clone()
+                .unwrap_or_else(|| env::var("USER").unwrap_or_else(|_| "user".to_string()));
             println!(
                 "  ssh:   ssh -p {port} {user}@{}",
                 plan.ssh_host.as_deref().unwrap_or("127.0.0.1")
@@ -412,7 +410,7 @@ pub(super) fn stop_vm_loaded(
             return Ok(());
         }
         if output == OutputFormat::Json {
-            println!("{}", json!({"name": vm.config.name, "state": "stopped"}));
+            print_json_success(json!({"name": vm.config.name, "state": "stopped"}));
         } else {
             println!("{} is already stopped", vm.config.name);
         }
@@ -444,10 +442,7 @@ pub(super) fn stop_vm_loaded(
         return Ok(());
     }
     if output == OutputFormat::Json {
-        println!(
-            "{}",
-            json!({"name": vm.config.name, "state": "stopped", "pid": pid})
-        );
+        print_json_success(json!({"name": vm.config.name, "state": "stopped", "pid": pid}));
     } else {
         println!("Stopped {} (pid {pid})", vm.config.name);
     }
@@ -472,10 +467,7 @@ pub(super) fn kill_vm(dirs: &Dirs, name: &str, output: OutputFormat) -> Result<(
     stop_virtiofsd(&vm.paths);
     remove_runtime_sockets(&vm.paths);
     if output == OutputFormat::Json {
-        println!(
-            "{}",
-            json!({"name": vm.config.name, "state": "killed", "pid": pid})
-        );
+        print_json_success(json!({"name": vm.config.name, "state": "killed", "pid": pid}));
     } else {
         println!("Killed {} (pid {pid})", vm.config.name);
     }

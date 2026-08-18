@@ -33,7 +33,7 @@ pub(super) fn shortcut_vm(
     }
     fs::write(&path, content).map_err(|error| Error::io(path.display(), error))?;
     if output == OutputFormat::Json {
-        println!("{}", json!({"name": vm.config.name, "shortcut": path}));
+        print_json_success(json!({"name": vm.config.name, "shortcut": path}));
     } else {
         println!("Created {}", path.display());
     }

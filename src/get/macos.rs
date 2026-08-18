@@ -225,7 +225,10 @@ pub(super) fn download_macos(
     if architecture != "amd64" {
         return Err(Error::message("macOS recovery is only available for amd64"));
     }
-    let name = suggested_name("macos", release, None, architecture);
+    let name = args
+        .name
+        .clone()
+        .unwrap_or_else(|| suggested_name("macos", release, None, architecture));
     validate_vm_name(&name)?;
     let root = if create_config {
         dirs.vm_dir.clone()
@@ -332,10 +335,7 @@ pub(super) fn download_macos(
         "config": config_path,
     });
     if output == OutputFormat::Json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&result).unwrap_or_default()
-        );
+        crate::print_json_success(result);
     } else if let Some(config_path) = config_path {
         println!("Created {}", config_path.display());
     } else {

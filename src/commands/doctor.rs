@@ -43,6 +43,22 @@ pub(super) fn doctor(dirs: &Dirs, name: Option<&str>, output: OutputFormat) -> R
             None,
         );
     }
+    let iso_builder = ["xorriso", "mkisofs", "genisoimage"]
+        .into_iter()
+        .find(|command| command_available(command));
+    push_doctor_check(
+        &mut checks,
+        "host.cloud_init_iso_builder",
+        if iso_builder.is_some() { "ok" } else { "warn" },
+        iso_builder.map_or_else(
+            || "cloud VM creation needs xorriso, mkisofs, or genisoimage".to_string(),
+            |command| format!("{command} is available for cloud-init seed images"),
+        ),
+        iso_builder.is_none().then_some(
+            "Install xorriso, mkisofs, or genisoimage before using `vmctl get --cloud`.",
+        ),
+        None,
+    );
 
     let qemu_capabilities = qemu_capability_report(&native_qemu);
     let runtime_failures = qemu_capabilities["runtime_probe_failures"]
@@ -391,6 +407,8 @@ pub(super) fn doctor(dirs: &Dirs, name: Option<&str>, output: OutputFormat) -> R
             ("vm.iso", vm.config.iso.as_ref()),
             ("vm.fixed_iso", vm.config.fixed_iso.as_ref()),
             ("vm.unattended_iso", vm.config.unattended_iso.as_ref()),
+            ("vm.cloud_base_img", vm.config.cloud_base_img.as_ref()),
+            ("vm.cloud_init_iso", vm.config.cloud_init_iso.as_ref()),
             ("vm.floppy", vm.config.floppy.as_ref()),
             ("vm.img", vm.config.img.as_ref()),
         ] {
@@ -631,8 +649,6 @@ pub(super) fn doctor(dirs: &Dirs, name: Option<&str>, output: OutputFormat) -> R
         .filter(|check| check["status"] == "warn")
         .count();
     let report = json!({
-        "schema_version": 1,
-        "ok": errors == 0,
         "scope": {"vm": name},
         "checks": checks,
         "summary": {"errors": errors, "warnings": warnings},
@@ -640,10 +656,7 @@ pub(super) fn doctor(dirs: &Dirs, name: Option<&str>, output: OutputFormat) -> R
 
     if output == OutputFormat::Json {
         if errors == 0 {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&report).unwrap_or_default()
-            );
+            print_json_success(report.clone());
         }
     } else {
         print_doctor_human(&report);

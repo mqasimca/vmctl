@@ -8,6 +8,40 @@ pub(super) fn complete_vm_names(current: &OsStr) -> Vec<CompletionCandidate> {
     vm_name_candidates(&completion_vm_dir(), current)
 }
 
+pub(super) fn complete_cached_images(current: &OsStr) -> Vec<CompletionCandidate> {
+    let Some(current) = current.to_str() else {
+        return Vec::new();
+    };
+    cached_image_candidates(&completion_vm_dir().join(".cache/objects"), current)
+        .into_iter()
+        .map(CompletionCandidate::new)
+        .collect()
+}
+
+fn cached_image_candidates(dir: &Path, current: &str) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut images = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            path.is_file()
+                .then(|| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .filter(|name| !name.starts_with('.'))
+                        .map(str::to_string)
+                })
+                .flatten()
+        })
+        .filter(|name| name.starts_with(current))
+        .collect::<Vec<_>>();
+    images.sort();
+    images
+}
+
 fn completion_vm_dir() -> PathBuf {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
     completion_vm_dir_from_args(&args)
@@ -96,5 +130,17 @@ mod tests {
             completion_vm_dir_from_args(&args),
             Some(PathBuf::from("/tmp/vmctl-vms"))
         );
+    }
+
+    #[test]
+    fn cached_image_completion_lists_objects() {
+        let root = tempfile::tempdir().unwrap();
+        let objects = root.path().join(".cache/objects");
+        fs::create_dir_all(&objects).unwrap();
+        fs::write(objects.join("freebsd.qcow2"), []).unwrap();
+        fs::write(objects.join("ubuntu.iso"), []).unwrap();
+
+        let candidates = cached_image_candidates(&objects, "free");
+        assert_eq!(candidates, vec!["freebsd.qcow2"]);
     }
 }

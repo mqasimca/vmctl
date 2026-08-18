@@ -956,7 +956,7 @@ fn plan_attaches_windows_install_media_in_stable_order() {
     let config_path = root.path().join("windows.conf");
     fs::write(
         &config_path,
-        "boot=legacy\ndisk_img=disk.qcow2\niso=windows.iso\nfixed_iso=virtio-win.iso\nunattended_iso=unattended.iso\ndisplay=none\nnetwork=none\npublic_dir=none\nguest_agent=false\n",
+        "guest_os=windows\nboot=legacy\ndisk_img=disk.qcow2\niso=windows.iso\nfixed_iso=virtio-win.iso\nunattended_iso=unattended.iso\ndisplay=none\nnetwork=none\npublic_dir=none\nguest_agent=false\n",
     )
     .unwrap();
     let vm = load_vm(root.path(), root.path(), config_path).unwrap();
@@ -984,6 +984,50 @@ fn plan_attaches_windows_install_media_in_stable_order() {
         args[0] == "-drive"
             && args[1].contains("media=cdrom,index=2,readonly=on")
             && args[1].contains("unattended.iso")
+    }));
+    assert!(
+        plan.args
+            .windows(2)
+            .any(|args| { args[0] == "-device" && args[1] == "ide-hd,drive=SystemDisk" })
+    );
+}
+
+#[test]
+fn plan_attaches_cloud_init_seed_media() {
+    let root = tempdir().unwrap();
+    for name in ["disk.qcow2", "base.qcow2", "seed.iso"] {
+        fs::write(root.path().join(name), []).unwrap();
+    }
+    let config_path = root.path().join("cloud.conf");
+    fs::write(
+        &config_path,
+        "boot=legacy\ndisk_img=disk.qcow2\ncloud_base_img=base.qcow2\ncloud_init_iso=seed.iso\ndisplay=none\nnetwork=none\npublic_dir=none\nguest_agent=false\n",
+    )
+    .unwrap();
+    let vm = load_vm(root.path(), root.path(), config_path).unwrap();
+    let host = QemuPlanContext {
+        qemu_binary: "qemu-system-x86_64".to_string(),
+        host_os: "linux".to_string(),
+        accelerator: "tcg".to_string(),
+        cpu_cores: 2,
+        ram: "4G".to_string(),
+        virtio_vga_gl: false,
+        usb_redirection: false,
+        smartcard: false,
+        smbd: false,
+        audio_driver: None,
+        username: "tester".to_string(),
+        bridge_helper: None,
+        virtiofsd: None,
+        virtiofs_device: false,
+        ssh_port: None,
+        spice_port: Some(5930),
+    };
+    let plan = build_plan(&vm, &host, false).unwrap();
+    assert!(plan.args.windows(2).any(|args| {
+        args[0] == "-drive"
+            && args[1].contains("media=cdrom,index=3,readonly=on")
+            && args[1].contains("seed.iso")
     }));
 }
 

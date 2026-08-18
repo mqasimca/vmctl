@@ -5,6 +5,8 @@ use std::path::Path;
 use serde_json::{Value, json};
 use thiserror::Error;
 
+use crate::AGENT_SCHEMA_VERSION;
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, Error)]
@@ -353,7 +355,7 @@ impl Error {
             Self::Message(_) | Self::Qmp(_) => {}
         }
         json!({
-            "schema_version": 1,
+            "schema_version": AGENT_SCHEMA_VERSION,
             "ok": false,
             "error": error,
         })
@@ -461,7 +463,7 @@ mod tests {
     fn json_error_has_stable_code_and_context() {
         let error = Error::config("vm.conf", "display is invalid");
         let value = error.json_value();
-        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["schema_version"], crate::AGENT_SCHEMA_VERSION);
         assert_eq!(value["ok"], false);
         assert_eq!(value["error"]["code"], "config_invalid");
         assert_eq!(value["error"]["path"], "vm.conf");

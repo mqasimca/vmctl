@@ -42,6 +42,35 @@ fn get_without_release_shows_os_options() {
 }
 
 #[test]
+fn cloud_get_selects_a_download_without_requiring_a_key() {
+    let args = GetArgs {
+        cloud: true,
+        os: Some("ubuntu".to_string()),
+        release_or_input: Some("24.04".to_string()),
+        ..GetArgs::default()
+    };
+    assert_eq!(select_operation(&args).unwrap(), Operation::CreateCloudVm);
+    assert!(validate_operation_arguments(&args, Operation::CreateCloudVm, false).is_ok());
+}
+
+#[test]
+fn create_requires_a_cached_image_name() {
+    assert!(cached_source(tempdir().unwrap().path(), "../image.iso").is_err());
+}
+
+#[test]
+fn freebsd_cloud_get_selects_a_cloud_vm() {
+    let args = GetArgs {
+        cloud: true,
+        os: Some("freebsd".to_string()),
+        release_or_input: Some("15.1".to_string()),
+        ..GetArgs::default()
+    };
+    assert_eq!(select_operation(&args).unwrap(), Operation::CreateCloudVm);
+    assert!(validate_operation_arguments(&args, Operation::CreateCloudVm, false).is_ok());
+}
+
+#[test]
 fn parses_freebsd_release_directories() {
     let listing = r#"
         <a href="../">Parent directory</a>

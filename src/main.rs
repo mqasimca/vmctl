@@ -33,7 +33,7 @@ fn main() -> std::process::ExitCode {
             eprintln!(
                 "{}",
                 serde_json::json!({
-                    "schema_version": 1,
+                    "schema_version": vmctl::AGENT_SCHEMA_VERSION,
                     "ok": false,
                     "error": {
                         "code": "cli_parse",

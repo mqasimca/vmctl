@@ -42,10 +42,7 @@ pub(super) fn report_host(output: OutputFormat) -> Result<()> {
         },
     });
     if output == OutputFormat::Json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&report).unwrap_or_default()
-        );
+        print_json_success(report);
     } else {
         println!(
             "host: {} {}",

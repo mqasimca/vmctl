@@ -28,6 +28,8 @@ pub struct VmConfig {
     pub iso: Option<PathBuf>,
     pub fixed_iso: Option<PathBuf>,
     pub unattended_iso: Option<PathBuf>,
+    pub cloud_base_img: Option<PathBuf>,
+    pub cloud_init_iso: Option<PathBuf>,
     pub floppy: Option<PathBuf>,
     pub img: Option<PathBuf>,
     pub macos_release: Option<String>,
@@ -40,6 +42,7 @@ pub struct VmConfig {
     pub access: String,
     pub allow_insecure_remote: bool,
     pub ssh_access: String,
+    pub ssh_user: Option<String>,
     pub viewer_extra_args: Vec<String>,
     pub gl: Option<bool>,
     pub width: Option<u32>,
@@ -264,6 +267,8 @@ impl VmConfig {
             iso: optional_path(root, values.get("iso"))?,
             fixed_iso: optional_path(root, values.get("fixed_iso"))?,
             unattended_iso: optional_path(root, values.get("unattended_iso"))?,
+            cloud_base_img: optional_path(root, values.get("cloud_base_img"))?,
+            cloud_init_iso: optional_path(root, values.get("cloud_init_iso"))?,
             floppy: optional_path(root, values.get("floppy"))?,
             img: optional_path(root, values.get("img"))?,
             macos_release: optional_string(values, "macos_release"),
@@ -281,6 +286,7 @@ impl VmConfig {
                 &config_path,
             )?,
             ssh_access: value_or(values, "ssh_access", "local").to_ascii_lowercase(),
+            ssh_user: optional_string(values, "ssh_user"),
             viewer_extra_args: parse_tokens(values.get("viewer_extra_args")),
             gl: optional_bool(values, "gl", &config_path)?,
             width: optional_u32(values, "width", &config_path)?,
@@ -356,6 +362,18 @@ impl VmConfig {
             &self.arch,
             &["x86_64", "aarch64"],
         )?;
+        if let Some(user) = &self.ssh_user
+            && (user.is_empty()
+                || user.len() > 32
+                || !user.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+                }))
+        {
+            return Err(Error::config(
+                &self.config_path,
+                "ssh_user must contain only letters, digits, hyphens, and underscores",
+            ));
+        }
         validate_one_of(&self.config_path, "boot", &self.boot, &["efi", "legacy"])?;
         if self.guest_os == "macos" && self.boot != "efi" {
             return Err(Error::config(

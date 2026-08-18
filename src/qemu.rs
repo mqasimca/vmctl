@@ -68,7 +68,8 @@ use storage::*;
 pub(crate) use capabilities::{qemu_capability_report, virtiofsd_available};
 pub(crate) use devices::{configured_bridge, virtiofs_requested};
 pub(crate) use disk::{
-    disk_check, disk_compact, disk_convert, disk_info, disk_resize, ensure_disk,
+    create_cloud_copy, create_cloud_overlay, disk_check, disk_compact, disk_convert, disk_info,
+    disk_resize, ensure_disk,
 };
 pub(crate) use guest::{disk_snapshot, guest_command, guest_exec, guest_shutdown};
 pub(crate) use host::render_node;

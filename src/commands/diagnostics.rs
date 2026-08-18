@@ -11,16 +11,13 @@ pub(super) fn logs_vm(
     let (lines, truncated) = read_log_lines(&path, max_lines)?;
     if output == OutputFormat::Json {
         let returned_lines = lines.len();
-        println!(
-            "{}",
-            json!({
-                "name": vm.config.name,
-                "path": path,
-                "lines": lines,
-                "returned_lines": returned_lines,
-                "truncated": truncated,
-            })
-        );
+        print_json_success(json!({
+            "name": vm.config.name,
+            "path": path,
+            "lines": lines,
+            "returned_lines": returned_lines,
+            "truncated": truncated,
+        }));
     } else if lines.is_empty() {
         println!("{} is empty", path.display());
     } else {

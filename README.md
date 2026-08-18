@@ -39,8 +39,12 @@ vmctl host ignore-msrs-always      # persist KVM MSR handling (Linux)
 vmctl shortcut VM                  # create a desktop launcher
 vmctl get --list                    # list supported OS images
 vmctl get freebsd                   # list current FreeBSD releases and media options
-vmctl get ubuntu 24.04              # download an image and create a VM config
-vmctl get --create-config NAME IMAGE_OR_URL
+vmctl get ubuntu 24.04              # download an installer ISO into the shared cache
+vmctl create ubuntu-lab --from <cached-image>  # press Tab to complete it
+vmctl get --cloud freebsd 15.1      # download a ZFS cloud QCOW2 into the shared cache
+vmctl create freebsd-01 --from <cached-image> --ssh-key ~/.ssh/id_ed25519.pub
+vmctl start freebsd-01 --wait ssh   # boot a cloud VM and wait for SSH
+vmctl ssh freebsd-01                # uses the image's default cloud user
 ```
 
 ## Requirements
@@ -67,7 +71,7 @@ sudo apt install -y \
   ovmf qemu-efi-aarch64 \
   virt-viewer spice-client-gtk \
   swtpm virtiofsd samba usbutils xdg-user-dirs passt \
-  gzip bzip2 unzip 7zip xorriso
+  gzip bzip2 xz-utils unzip 7zip xorriso
 ```
 
 The project uses Rust 1.85 or newer because it targets edition 2024. Install
@@ -93,7 +97,7 @@ sudo apt install -y \
   ovmf qemu-efi-aarch64 \
   virt-viewer spice-client-gtk \
   swtpm samba usbutils xdg-user-dirs passt \
-  gzip bzip2 unzip 7zip xorriso
+  gzip bzip2 xz-utils unzip 7zip xorriso
 ```
 
 Install Rust stable with the `rustup` commands shown above. On older Debian
@@ -108,7 +112,7 @@ sudo pacman -Syu --needed \
   qemu-full edk2-ovmf edk2-aarch64 \
   virt-viewer spice-gtk \
   swtpm virtiofsd samba usbutils xdg-user-dirs passt \
-  gzip bzip2 unzip 7zip cdrtools libisoburn
+  gzip bzip2 xz unzip 7zip cdrtools libisoburn
 rustup default stable
 ```
 
@@ -123,7 +127,7 @@ sudo dnf install -y \
   edk2-ovmf edk2-aarch64 \
   virt-viewer spice-gtk \
   swtpm virtiofsd samba usbutils xdg-user-dirs passt \
-  gzip bzip2 unzip 7zip xorriso
+  gzip bzip2 xz unzip 7zip xorriso
 rustup default stable
 ```
 
@@ -136,7 +140,7 @@ sudo zypper install -y \
   qemu qemu-arm qemu-utils qemu-ovmf-x86_64 qemu-uefi-aarch64 \
   virt-viewer spice-gtk \
   swtpm virtiofsd samba usbutils xdg-user-dirs passt \
-  gzip bzip2 unzip 7zip xorriso
+  gzip bzip2 xz unzip 7zip xorriso
 rustup default stable
 ```
 
@@ -197,7 +201,40 @@ also require a permitted host bridge. `vmctl doctor VM` verifies that a configur
 bridge exists on Linux and that the helper is installed without changing networking.
 It cannot verify the helper's bridge policy without attempting a VM start.
 `xorriso` is used for Windows
-unattended media and can be replaced by `mkisofs` or `genisoimage`.
+unattended media and cloud-init seed images; it can be replaced by `mkisofs`
+or `genisoimage`.
+
+## Cloud images
+
+`vmctl get` only downloads verified installer ISO or cloud QCOW2 media to the
+shared cache. `vmctl create` creates a VM from one cached object; its `--from`
+value completes with Tab. Debian major versions such as `13` are translated to
+their upstream codenames automatically.
+
+```bash
+vmctl get --cloud ubuntu 24.04
+vmctl create web-01 --from <cached-image> --ssh-key ~/.ssh/id_ed25519.pub
+vmctl create worker-01 --from <cached-image> --ssh-key ~/.ssh/id_ed25519.pub
+vmctl start web-01 --wait ssh
+vmctl ssh web-01
+```
+
+The default login is `ubuntu`, `debian`, `fedora`, or `freebsd` for the respective image;
+`vmctl ssh` selects it automatically and `--user` still overrides it. Use
+`--hostname NAME` to set the guest hostname and `--network-config PATH` to add
+a cloud-init network configuration. `vmctl get --cloud --url …` prints the
+resolved image URL, while `--check` performs a read-only availability check.
+FreeBSD cloud images use ZFS and configure passwordless `doas` for the
+SSH-key-provisioned `freebsd` user; the upstream default passwords are replaced
+with random values.
+
+The default `create --disk-mode linked` creates a small QCOW2 overlay backed by the
+verified cache object, so each VM has independent writes without redownloading
+the base. Use `--disk-mode copy` for a full, self-contained QCOW2 disk. Cache
+objects use readable, collision-resistant names such as
+`ubuntu-26.04-server-cloudimg-arm64--sha256-4d3b8a716c20.qcow2` under
+`<vm-dir>/.cache/objects/`. Use `--refresh-cache` to download a new copy
+deliberately.
 
 These optional programs enable additional features:
 
@@ -335,18 +372,13 @@ macOS recovery media and Windows Server downloads are resolved directly;
 consumer Windows downloads can be rejected by Microsoft's anti-automation
 service, in which case the CLI gives the browser/manual-import path.
 
-Windows VM creation also downloads VirtIO drivers and builds unattended
-installation media by default. Pass `--disable-unattended` to skip that media.
-Use `--create-config NAME IMAGE_OR_URL` for a manually downloaded image or a
-provider that requires browser authentication.
-
 `get --insecure` (or `VMCTL_INSECURE=1`) disables TLS certificate
 verification for URL checks and media downloads. This is unsafe and should be
 used only on a trusted network.
 
 `vmctl get OS` shows image options without downloading. For FreeBSD it queries
 the official release directory for current releases; use
-`vmctl get freebsd RELEASE EDITION` (where EDITION is `disc1` or `dvd1`) to create a VM. GTK clipboard sharing
+`vmctl get freebsd RELEASE EDITION` (where EDITION is `disc1` or `dvd1`) to cache the installer, then use `vmctl create`. GTK clipboard sharing
 is disabled by default: set `clipboard="on"` in a GTK VM configuration or pass
 `vmctl start VM --clipboard`. It requires QEMU 11.1 or newer and the guest
 `spice-vdagent` service.
@@ -380,10 +412,26 @@ For a running VM, `status --output json` also queries QMP and returns
 `qmp_status.status` (for example `running` or `paused`) or a bounded error when
 the process exists but its QMP endpoint is unavailable.
 
-Use `--output json` for automation. Successful diagnostics are written to
-stdout; failures are written as one JSON error object to stderr and return a
-non-zero exit status. Error objects include a stable error code, message,
-context, and (for `doctor`) the complete diagnostic report. Human output is
+## Automation contract
+
+Use `vmctl schema` to inspect the versioned JSON contract. Every command that
+supports `--output json` writes one success object to stdout:
+
+```json
+{"schema_version": 1, "ok": true, "result": {}}
+```
+
+Failures write one object to stderr, return a non-zero exit status, and retain
+the stable machine-readable error code:
+
+```json
+{"schema_version": 1, "ok": false, "error": {"code": "…", "message": "…"}}
+```
+
+`result` and fields in `error` beyond `code` and `message` are
+command-specific; they may gain fields, so automation should rely only on
+fields documented by `vmctl schema`. The `ssh` and `completion` commands
+intentionally keep their native terminal/script output. Human output is
 intended for terminals and is not a machine-readable interface.
 
 Each VM state directory contains `qemu.log` and `qemu.command`. Startup

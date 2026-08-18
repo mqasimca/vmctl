@@ -1,5 +1,6 @@
 pub mod cli;
 
+mod agent;
 mod config;
 mod error;
 mod get;
@@ -24,6 +25,8 @@ use std::os::unix::{fs::PermissionsExt, process::CommandExt};
 
 use serde_json::{Value, json};
 
+pub(crate) use agent::print_json_success;
+
 use cli::{
     Cli, Command as VmCommand, DiskAction, GuestAction, HostAction, LaunchOptions, OutputFormat,
     SnapshotAction, StartWait,
@@ -40,12 +43,18 @@ use qemu::{
     wait_for_exit, write_runtime_files,
 };
 
+pub const AGENT_SCHEMA_VERSION: u32 = 1;
+
 pub use config::{Vm, VmConfig, VmState, parse_config, parse_tokens};
 pub use error::{Error, Error as VmctlError, Result};
 pub use paths::VmPaths;
 pub use qemu::{QemuPlan, QemuPlanContext};
 
 pub fn run(cli: Cli) -> Result<()> {
+    if matches!(cli.command.as_ref(), Some(VmCommand::Schema)) {
+        print_json_success(agent::schema());
+        return Ok(());
+    }
     if let Some(VmCommand::Completion { shell }) = cli.command.as_ref() {
         return generate_completions(*shell);
     }
@@ -63,6 +72,7 @@ pub fn run(cli: Cli) -> Result<()> {
 
     match cli.command.unwrap_or(VmCommand::List) {
         VmCommand::List => list_vms(&dirs, output),
+        VmCommand::Schema => unreachable!("schema handled before path setup"),
         VmCommand::Completion { .. } => unreachable!("completion handled before path setup"),
         VmCommand::Status { vm } => status_vms(&dirs, vm.as_deref(), output),
         VmCommand::Plan {
@@ -104,6 +114,7 @@ pub fn run(cli: Cli) -> Result<()> {
         VmCommand::Doctor { vm } => doctor(&dirs, vm.as_deref(), output),
         VmCommand::Host { action } => host_action(action, output),
         VmCommand::Get(args) => get::run(&args, &dirs, output),
+        VmCommand::Create(args) => get::create(&args, &dirs, output),
     }
 }
 

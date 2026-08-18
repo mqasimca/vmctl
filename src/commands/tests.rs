@@ -27,6 +27,12 @@ fn command_line_parsing_keeps_vm_names_and_options() {
 }
 
 #[test]
+fn command_line_parses_schema() {
+    let cli = Cli::try_parse_from(["vmctl", "schema"]).unwrap();
+    assert!(matches!(cli.command, Some(VmCommand::Schema)));
+}
+
+#[test]
 fn command_line_parses_network_and_viewer_overrides() {
     let cli = Cli::try_parse_from([
         "vmctl",
@@ -352,6 +358,19 @@ fn get_and_host_commands_are_typed() {
             && destination == Path::new("ubuntu.raw")
             && format == "raw"
     ));
+}
+
+#[test]
+fn create_command_is_typed() {
+    let cli = Cli::try_parse_from([
+        "vmctl",
+        "create",
+        "ubuntu-lab",
+        "--from",
+        "ubuntu-24.04-desktop-amd64--sha256-123456789abc.iso",
+    ])
+    .unwrap();
+    assert!(matches!(cli.command, Some(VmCommand::Create(_))));
 }
 
 #[test]

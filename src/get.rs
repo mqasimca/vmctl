@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
-use crate::cli::{GetArgs, OutputFormat};
+use crate::cli::{CreateArgs, DiskMode, GetArgs, OutputFormat};
 use crate::error::{Error, Result};
 use crate::paths::Dirs;
 
@@ -37,8 +37,14 @@ mod io;
 use io::*;
 mod config_writer;
 use config_writer::*;
+mod cache;
+use cache::*;
+mod iso;
+use iso::*;
+mod cloud;
+use cloud::*;
 
-pub(super) use commands::run;
+pub(super) use commands::{create, run};
 
 #[cfg(test)]
 mod tests;

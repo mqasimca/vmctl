@@ -4,7 +4,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, engine::ArgValueCompleter};
 
 mod completion;
-use completion::complete_vm_names;
+use completion::{complete_cached_images, complete_vm_names};
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 pub enum OutputFormat {
@@ -18,13 +18,21 @@ pub enum StartWait {
     Ssh,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum DiskMode {
+    /// Use a small writable QCOW2 overlay backed by the cached cloud image.
+    Linked,
+    /// Create a full independent QCOW2 copy from the cached cloud image.
+    Copy,
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "vmctl",
     version,
     about = "Manage QEMU/KVM virtual machines",
     long_about = "Manage QEMU/KVM virtual machines directly from the host.\n\nVM configuration files are read as data and never executed.",
-    after_long_help = "Examples:\n  vmctl get ubuntu 24.04      Download an Ubuntu image and create its VM configuration\n  vmctl start ubuntu-24.04    Start the VM\n  vmctl stop ubuntu-24.04     Request a clean shutdown\n  vmctl doctor ubuntu-24.04   Check host and VM readiness"
+    after_long_help = "Examples:\n  vmctl get ubuntu 24.04      Download Ubuntu media to the shared cache\n  vmctl create ubuntu-lab --from ubuntu-24.04-desktop-amd64--sha256-…iso\n  vmctl start ubuntu-lab      Start the VM\n  vmctl doctor ubuntu-lab     Check host and VM readiness"
 )]
 pub struct Cli {
     /// Directory containing VM .conf files.
@@ -41,7 +49,7 @@ pub struct Cli {
     #[arg(long, value_name = "PATH", global = true)]
     pub state_dir: Option<PathBuf>,
 
-    /// Output format for commands that return structured data.
+    /// Output format. JSON responses use vmctl's versioned automation contract.
     #[arg(long, value_enum, default_value_t = OutputFormat::Human, global = true)]
     pub output: OutputFormat,
 
@@ -63,6 +71,9 @@ pub enum Command {
         #[arg(value_enum, value_name = "SHELL")]
         shell: Shell,
     },
+
+    /// Print the versioned JSON contract for automation clients.
+    Schema,
 
     /// Show one VM in detail, or list all VMs when no name is given.
     Status {
@@ -246,8 +257,11 @@ pub enum Command {
         action: HostAction,
     },
 
-    /// Download OS images and create VM configurations.
+    /// Download and cache an OS installer ISO or cloud image.
     Get(GetArgs),
+
+    /// Create a VM from a verified cached image.
+    Create(CreateArgs),
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -262,12 +276,34 @@ pub struct GetArgs {
     #[arg(long, value_name = "ARCH")]
     pub arch: Option<String>,
 
-    /// Download an image without creating a VM configuration.
+    /// Download an official cloud QCOW2 image instead of an installer ISO.
+    #[arg(long)]
+    pub cloud: bool,
+
+    #[arg(skip)]
+    pub name: Option<String>,
+
+    #[arg(skip)]
+    pub disk_mode: Option<DiskMode>,
+
+    /// Redownload a VM image even when a verified cached copy exists.
+    #[arg(long)]
+    pub refresh_cache: bool,
+
+    #[arg(skip)]
+    pub ssh_keys: Vec<PathBuf>,
+
+    #[arg(skip)]
+    pub hostname: Option<String>,
+
+    #[arg(skip)]
+    pub network_config: Option<PathBuf>,
+
+    /// Download an image to the current directory instead of the shared cache.
     #[arg(long)]
     pub download: bool,
 
-    /// Create a VM configuration from a local image or URL.
-    #[arg(long)]
+    #[arg(skip)]
     pub create_config: bool,
 
     /// Open the operating system homepage.
@@ -306,25 +342,51 @@ pub struct GetArgs {
     #[arg(long)]
     pub version: bool,
 
-    /// Skip generated Windows unattended-installation media.
-    #[arg(long)]
+    #[arg(skip)]
     pub disable_unattended: bool,
 
     /// Disable TLS certificate verification for network checks and downloads (unsafe; also VMCTL_INSECURE=1).
     #[arg(long)]
     pub insecure: bool,
 
-    /// OS to inspect or download, or VM name / `custom` for --create-config.
+    /// Operating system to inspect or download.
     #[arg(value_name = "OS")]
     pub os: Option<String>,
 
-    /// Release, or the local image/URL for --create-config.
+    /// Release to download.
     #[arg(value_name = "RELEASE_OR_INPUT")]
     pub release_or_input: Option<String>,
 
     /// Edition or language.
     #[arg(value_name = "EDITION_OR_LANGUAGE")]
     pub edition_or_language: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct CreateArgs {
+    /// Name for the new VM.
+    #[arg(value_name = "VM")]
+    pub name: String,
+
+    /// Cached image file name; complete it with Tab.
+    #[arg(long = "from", value_name = "IMAGE", add = ArgValueCompleter::new(complete_cached_images))]
+    pub image: String,
+
+    /// Cloud disk layout: linked overlay (default) or full copy.
+    #[arg(long, value_enum, value_name = "MODE")]
+    pub disk_mode: Option<DiskMode>,
+
+    /// OpenSSH public key to install in a cloud VM (repeatable).
+    #[arg(long = "ssh-key", value_name = "PATH")]
+    pub ssh_keys: Vec<PathBuf>,
+
+    /// Host name configured in a cloud VM (defaults to the VM name).
+    #[arg(long, value_name = "NAME")]
+    pub hostname: Option<String>,
+
+    /// cloud-init network-config file to include in a cloud VM seed image.
+    #[arg(long, value_name = "PATH")]
+    pub network_config: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Subcommand)]

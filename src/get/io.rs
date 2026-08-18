@@ -93,6 +93,18 @@ pub(super) fn verify_checksum(path: &Path, expected: Option<&str>) -> Result<()>
     };
     let (algorithm, expected) = expected.split_once(':').unwrap_or(("sha256", expected));
     let expected = expected.to_ascii_lowercase();
+    let actual = checksum_digest(path, algorithm)?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(Error::message(format!(
+            "checksum mismatch for {} (expected {expected}, got {actual})",
+            path.display()
+        )))
+    }
+}
+
+pub(super) fn checksum_digest(path: &Path, algorithm: &str) -> Result<String> {
     let (command, arguments): (&str, &[&str]) = match algorithm.to_ascii_lowercase().as_str() {
         "sha256" => {
             if command_exists("sha256sum") {
@@ -130,19 +142,11 @@ pub(super) fn verify_checksum(path: &Path, expected: Option<&str>) -> Result<()>
     if !output.status.success() {
         return Err(Error::command_failed_status(command, output.status));
     }
-    let actual = String::from_utf8_lossy(&output.stdout)
+    Ok(String::from_utf8_lossy(&output.stdout)
         .split_whitespace()
         .next()
         .unwrap_or_default()
-        .to_ascii_lowercase();
-    if actual == expected {
-        Ok(())
-    } else {
-        Err(Error::message(format!(
-            "checksum mismatch for {} (expected {expected}, got {actual})",
-            path.display()
-        )))
-    }
+        .to_ascii_lowercase())
 }
 
 pub(super) fn command_exists(command: &str) -> bool {
@@ -208,13 +212,13 @@ pub(super) fn prepare_image(path: &Path) -> Result<PathBuf> {
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if !matches!(extension.as_str(), "zip" | "7z" | "gz" | "bz2") {
+    if !matches!(extension.as_str(), "zip" | "7z" | "gz" | "bz2" | "xz") {
         return Ok(path.to_path_buf());
     }
     let parent = path
         .parent()
         .ok_or_else(|| Error::message("archive has no parent directory"))?;
-    if extension == "gz" || extension == "bz2" {
+    if matches!(extension.as_str(), "gz" | "bz2" | "xz") {
         let output = path.with_extension("");
         if fs::symlink_metadata(&output)
             .ok()
@@ -225,7 +229,12 @@ pub(super) fn prepare_image(path: &Path) -> Result<PathBuf> {
                 output.display()
             )));
         }
-        let command = if extension == "gz" { "gzip" } else { "bzip2" };
+        let command = match extension.as_str() {
+            "gz" => "gzip",
+            "bz2" => "bzip2",
+            "xz" => "xz",
+            _ => unreachable!(),
+        };
         let status = Command::new(command)
             .args(["-d", "-f"])
             .arg(path)

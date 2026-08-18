@@ -3,21 +3,18 @@ use super::*;
 pub(super) fn print_plan(plan: &qemu::QemuPlan, output: OutputFormat, redact: bool) {
     let args = redact_plan_args(&plan.args, redact);
     if output == OutputFormat::Json {
-        println!(
-            "{}",
-            json!({
-                "binary": plan.binary,
-                "args": args,
-                "command": shell_join(&plan.binary, &args),
-                "ssh_port": plan.ssh_port,
-                "ssh_host": plan.ssh_host,
-                "spice_port": plan.spice_port,
-                "spice_host": plan.spice_host,
-                "monitor_telnet": plan.monitor_telnet.as_ref().map(|(host, port)| json!({"host": host, "port": port})),
-                "serial_telnet": plan.serial_telnet.as_ref().map(|(host, port)| json!({"host": host, "port": port})),
-                "redacted": redact,
-            })
-        );
+        print_json_success(json!({
+            "binary": plan.binary,
+            "args": args,
+            "command": shell_join(&plan.binary, &args),
+            "ssh_port": plan.ssh_port,
+            "ssh_host": plan.ssh_host,
+            "spice_port": plan.spice_port,
+            "spice_host": plan.spice_host,
+            "monitor_telnet": plan.monitor_telnet.as_ref().map(|(host, port)| json!({"host": host, "port": port})),
+            "serial_telnet": plan.serial_telnet.as_ref().map(|(host, port)| json!({"host": host, "port": port})),
+            "redacted": redact,
+        }));
         return;
     }
     println!("{}", shell_join(&plan.binary, &args));
@@ -81,6 +78,7 @@ pub(super) fn vm_summary(vm: &Vm) -> Result<Value> {
         "guest_os": vm.config.guest_os,
         "arch": vm.config.arch,
         "ssh_access": vm.config.ssh_access,
+        "ssh_user": vm.config.ssh_user,
     }))
 }
 
@@ -113,6 +111,7 @@ pub(super) fn vm_status(vm: &Vm) -> Result<Value> {
         "boot": vm.config.boot,
         "ssh_port": summary["ssh_port"].clone(),
         "ssh_access": vm.config.ssh_access,
+        "ssh_user": vm.config.ssh_user,
         "ipc": ipc,
         "qmp_status": qmp_status,
         "monitor": vm.paths.monitor_socket(),
@@ -148,6 +147,9 @@ pub(super) fn print_vm_status(vm: &Vm) -> Result<()> {
         "ssh port:    {}",
         effective_ssh_port(vm)?.map_or_else(|| "auto".to_string(), |port| port.to_string())
     );
+    if let Some(user) = &vm.config.ssh_user {
+        println!("ssh user:    {user}");
+    }
     println!("qmp:         {}", ipc_endpoint_label(&ipc["qmp"]));
     let qmp_state = match vm.state()? {
         VmState::Stopped => "stopped".to_string(),
