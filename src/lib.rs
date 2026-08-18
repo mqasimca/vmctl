@@ -14,8 +14,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration;
 
+use clap::CommandFactory;
+use clap_complete::{Shell, generate};
+
 #[cfg(unix)]
-use std::os::unix::process::CommandExt;
+use std::os::unix::{fs::PermissionsExt, process::CommandExt};
 
 use serde_json::{Value, json};
 
@@ -26,12 +29,13 @@ use cli::{
 use config::{discover, find};
 use paths::Dirs;
 use qemu::{
-    HostCapabilities, acquire_vm_lock, build_plan, disk_check, disk_compact, disk_convert,
-    disk_info, disk_resize, disk_snapshot, ensure_disk, ensure_ipc_endpoints_available,
-    guest_command, guest_exec, guest_shutdown, ipc_report, kill_process, qemu_capability_report,
-    qmp_ping, qmp_status, remove_runtime_sockets, render_node, send_monitor_command, shell_join,
-    shutdown_via_qmp, spice_address, start_tpm, start_virtiofsd, stop_tpm, stop_virtiofsd,
-    virtiofs_requested, virtiofsd_available, wait_for_exit, write_runtime_files,
+    HostCapabilities, acquire_vm_lock, build_plan, configured_bridge, disk_check, disk_compact,
+    disk_convert, disk_info, disk_resize, disk_snapshot, ensure_disk,
+    ensure_ipc_endpoints_available, guest_command, guest_exec, guest_shutdown, ipc_report,
+    kill_process, qemu_capability_report, qmp_ping, qmp_status, remove_runtime_sockets,
+    render_node, send_monitor_command, shell_join, shutdown_via_qmp, spice_address, start_tpm,
+    start_virtiofsd, stop_tpm, stop_virtiofsd, virtiofs_requested, virtiofsd_available,
+    wait_for_exit, write_runtime_files,
 };
 
 pub use config::{Vm, VmConfig, VmState, parse_config, parse_tokens};
@@ -40,6 +44,10 @@ pub use paths::VmPaths;
 pub use qemu::{QemuPlan, QemuPlanContext};
 
 pub fn run(cli: Cli) -> Result<()> {
+    if let Some(VmCommand::Completion { shell }) = cli.command.as_ref() {
+        return generate_completions(*shell);
+    }
+
     let dirs = Dirs::from_cli(&cli)?;
     let output = cli.output;
 
@@ -53,6 +61,7 @@ pub fn run(cli: Cli) -> Result<()> {
 
     match cli.command.unwrap_or(VmCommand::List) {
         VmCommand::List => list_vms(&dirs, output),
+        VmCommand::Completion { .. } => unreachable!("completion handled before path setup"),
         VmCommand::Status { vm } => status_vms(&dirs, vm.as_deref(), output),
         VmCommand::Plan {
             vm,
@@ -60,6 +69,7 @@ pub fn run(cli: Cli) -> Result<()> {
             options,
         } => plan_vm(&dirs, &vm, &options, output, redact),
         VmCommand::Start { vm, options } => start_vm(&dirs, &vm, &options, output),
+        VmCommand::Ssh { vm, user } => ssh_vm(&dirs, &vm, user.as_deref()),
         VmCommand::Stop { vm, timeout, force } => stop_vm(&dirs, &vm, timeout, force, output),
         VmCommand::Kill { vm } => kill_vm(&dirs, &vm, output),
         VmCommand::Logs { vm, lines } => logs_vm(&dirs, &vm, lines as usize, output),
@@ -89,6 +99,13 @@ pub fn run(cli: Cli) -> Result<()> {
     }
 }
 
+fn generate_completions(shell: Shell) -> Result<()> {
+    let mut command = Cli::command();
+    let name = command.get_name().to_string();
+    generate(shell, &mut command, name, &mut std::io::stdout());
+    Ok(())
+}
+
 fn list_vms(dirs: &Dirs, output: OutputFormat) -> Result<()> {
     let vms = discover(&dirs.vm_dir, &dirs.state_root)?;
     if output == OutputFormat::Json {
@@ -107,10 +124,8 @@ fn list_vms(dirs: &Dirs, output: OutputFormat) -> Result<()> {
 
     println!("{:<28} {:<16} {:<8} CONFIG", "NAME", "STATE", "SSH");
     for vm in vms {
-        let ssh = vm
-            .config
-            .ssh_port
-            .map_or_else(|| "auto".to_string(), |port| port.to_string());
+        let ssh =
+            effective_ssh_port(&vm)?.map_or_else(|| "auto".to_string(), |port| port.to_string());
         println!(
             "{:<28} {:<16} {:<8} {}",
             vm.config.name,
@@ -164,6 +179,45 @@ fn start_vm(dirs: &Dirs, name: &str, options: &LaunchOptions, output: OutputForm
     let vm = load_effective_vm(dirs, name, options)?;
     let _operation_lock = acquire_vm_lock(&vm.paths)?;
     start_vm_loaded(&vm, output)
+}
+
+fn ssh_vm(dirs: &Dirs, name: &str, user: Option<&str>) -> Result<()> {
+    let vm = find(&dirs.vm_dir, &dirs.state_root, name)?;
+    if !matches!(vm.state()?, VmState::Running(_)) {
+        return Err(Error::message(format!(
+            "{} is not running; start it before opening SSH",
+            vm.config.name
+        )));
+    }
+    let port = runtime_port(&vm.paths.state_dir.join("ports"), "ssh")
+        .or(vm.config.ssh_port)
+        .ok_or_else(|| {
+            Error::message(format!(
+                "{} has no active SSH forward; set ssh_port and restart it",
+                vm.config.name
+            ))
+        })?;
+    let host = match vm.config.ssh_access.as_str() {
+        "" | "local" | "remote" => "127.0.0.1",
+        host => host,
+    };
+    let mut command = ProcessCommand::new("ssh");
+    command
+        .args(vm_ssh_options())
+        .arg("-p")
+        .arg(port.to_string());
+    if let Some(user) = user {
+        command.arg("-l").arg(user);
+    }
+    let status = command
+        .arg(host)
+        .status()
+        .map_err(|error| Error::command_unavailable("ssh", error))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(Error::command_failed_status("ssh", status))
+    }
 }
 
 fn start_vm_loaded(vm: &Vm, output: OutputFormat) -> Result<()> {
@@ -1126,6 +1180,38 @@ fn doctor(dirs: &Dirs, name: Option<&str>, output: OutputFormat) -> Result<()> {
             None,
             None,
         );
+        if let Some(bridge) = configured_bridge(&vm.config) {
+            let (status, message, hint) = if env::consts::OS != "linux" {
+                (
+                    "skip",
+                    format!(
+                        "bridge {bridge} was configured; Linux bridge inspection is unavailable"
+                    ),
+                    None,
+                )
+            } else if !is_linux_bridge(Path::new("/sys/class/net"), bridge) {
+                (
+                    "error",
+                    format!("configured bridge {bridge} does not exist or is not a Linux bridge"),
+                    Some("Create the bridge, attach a host interface, or use network=user."),
+                )
+            } else if !bridge_helper {
+                (
+                    "error",
+                    format!("qemu-bridge-helper is required by bridge {bridge} but is unavailable"),
+                    Some("Install qemu-bridge-helper or use network=user."),
+                )
+            } else {
+                (
+                    "warn",
+                    format!(
+                        "Linux bridge {bridge} is present, but qemu-bridge-helper policy is not verified"
+                    ),
+                    Some("Ensure the qemu-bridge-helper policy allows this bridge."),
+                )
+            };
+            push_doctor_check(&mut checks, "vm.bridge", status, message, hint, None);
+        }
         let vm_qemu_binary = format!("qemu-system-{}", vm.config.arch);
         let vm_qemu_capabilities = qemu_capability_report(&vm_qemu_binary);
         let vm_qemu_available =
@@ -1476,6 +1562,10 @@ fn doctor(dirs: &Dirs, name: Option<&str>, output: OutputFormat) -> Result<()> {
     Ok(())
 }
 
+fn is_linux_bridge(network_root: &Path, bridge: &str) -> bool {
+    network_root.join(bridge).join("bridge").is_dir()
+}
+
 fn push_doctor_check(
     checks: &mut Vec<Value>,
     id: &str,
@@ -1778,9 +1868,26 @@ fn find_command(command: &str) -> Option<String> {
         names
             .iter()
             .map(|name| directory.join(name))
-            .find(|candidate| candidate.is_file())
+            .find(|candidate| is_executable_file(candidate))
             .map(|candidate| candidate.to_string_lossy().into_owned())
     })
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 fn load_effective_vm(dirs: &Dirs, name: &str, options: &LaunchOptions) -> Result<Vm> {
@@ -1810,6 +1917,7 @@ fn apply_launch_options(vm: &mut Vm, options: &LaunchOptions) -> Result<()> {
         config.usb_controller = "xhci".to_string();
     }
     config.fullscreen |= options.fullscreen;
+    config.clipboard |= options.clipboard;
     config.offline |= options.offline;
     config.status_quo |= options.status_quo;
     config.ignore_tsc_warning |= options.ignore_tsc_warning;
@@ -1960,7 +2068,7 @@ fn vm_summary(vm: &Vm) -> Result<Value> {
         "state": state,
         "pid": pid,
         "config": vm.config.config_path,
-        "ssh_port": vm.config.ssh_port,
+        "ssh_port": effective_ssh_port(vm)?,
         "guest_os": vm.config.guest_os,
         "arch": vm.config.arch,
         "ssh_access": vm.config.ssh_access,
@@ -1994,7 +2102,7 @@ fn vm_status(vm: &Vm) -> Result<Value> {
         "disk": vm.config.disk_img,
         "disk_size": vm.config.disk_size,
         "boot": vm.config.boot,
-        "ssh_port": vm.config.ssh_port,
+        "ssh_port": summary["ssh_port"].clone(),
         "ssh_access": vm.config.ssh_access,
         "ipc": ipc,
         "qmp_status": qmp_status,
@@ -2029,9 +2137,7 @@ fn print_vm_status(vm: &Vm) -> Result<()> {
     println!("boot:        {}", vm.config.boot);
     println!(
         "ssh port:    {}",
-        vm.config
-            .ssh_port
-            .map_or_else(|| "auto".to_string(), |port| port.to_string())
+        effective_ssh_port(vm)?.map_or_else(|| "auto".to_string(), |port| port.to_string())
     );
     println!("qmp:         {}", ipc_endpoint_label(&ipc["qmp"]));
     let qmp_state = match vm.state()? {
@@ -2337,6 +2443,28 @@ fn runtime_port(path: &Path, wanted: &str) -> Option<u16> {
     })
 }
 
+fn effective_ssh_port(vm: &Vm) -> Result<Option<u16>> {
+    if matches!(vm.state()?, VmState::Running(_)) {
+        Ok(runtime_port(&vm.paths.state_dir.join("ports"), "ssh").or(vm.config.ssh_port))
+    } else {
+        Ok(vm.config.ssh_port)
+    }
+}
+
+fn vm_ssh_options() -> [String; 8] {
+    let null_device = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    [
+        "-o".to_string(),
+        format!("UserKnownHostsFile={null_device}"),
+        "-o".to_string(),
+        format!("GlobalKnownHostsFile={null_device}"),
+        "-o".to_string(),
+        "StrictHostKeyChecking=no".to_string(),
+        "-o".to_string(),
+        "LogLevel=ERROR".to_string(),
+    ]
+}
+
 fn ensure_delete_allowed(vm: &Vm, yes: bool) -> Result<()> {
     if matches!(vm.state()?, VmState::Running(_)) {
         return Err(Error::message(format!(
@@ -2403,6 +2531,7 @@ fn cli_path(path: &Path) -> Result<PathBuf> {
 mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
+    use clap_complete::{Shell, generate};
 
     #[test]
     fn command_line_parsing_keeps_vm_names_and_options() {
@@ -2447,6 +2576,74 @@ mod tests {
                 if options.ssh_access.as_deref() == Some("remote")
                     && options.viewer_extra_args == ["--foo", "bar"]
         ));
+    }
+
+    #[test]
+    fn command_line_parses_gtk_clipboard_option() {
+        let cli = Cli::try_parse_from(["vmctl", "start", "ubuntu", "--clipboard"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(VmCommand::Start { options, .. }) if options.clipboard
+        ));
+    }
+
+    #[test]
+    fn command_line_parses_ssh_user() {
+        let cli = Cli::try_parse_from(["vmctl", "ssh", "freebsd", "--user", "root"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(VmCommand::Ssh { vm, user }) if vm == "freebsd" && user.as_deref() == Some("root")
+        ));
+    }
+
+    #[test]
+    fn vm_ssh_does_not_persist_host_keys() {
+        let options = vm_ssh_options();
+        let null_device = if cfg!(windows) { "NUL" } else { "/dev/null" };
+        assert!(options.contains(&format!("UserKnownHostsFile={null_device}")));
+        assert!(options.contains(&format!("GlobalKnownHostsFile={null_device}")));
+        assert!(options.contains(&"StrictHostKeyChecking=no".to_string()));
+    }
+
+    #[test]
+    fn generates_bash_completions() {
+        let mut command = Cli::command();
+        let mut output = Vec::new();
+        generate(Shell::Bash, &mut command, "vmctl", &mut output);
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("vmctl"));
+        assert!(output.contains("completion"));
+    }
+
+    #[test]
+    fn runtime_port_reads_saved_ssh_port() {
+        let root = tempfile::tempdir().unwrap();
+        let ports = root.path().join("ports");
+        fs::write(&ports, "spice,5930\nssh,22220\n").unwrap();
+        assert_eq!(runtime_port(&ports, "ssh"), Some(22220));
+    }
+
+    #[test]
+    fn launch_options_enable_gtk_clipboard() {
+        let root = tempfile::tempdir().unwrap();
+        let config_path = root.path().join("clipboard.conf");
+        fs::write(
+            &config_path,
+            "boot=legacy\ndisplay=gtk\nnetwork=none\npublic_dir=none\n",
+        )
+        .unwrap();
+        let mut vm = find(root.path(), root.path(), "clipboard").unwrap();
+
+        apply_launch_options(
+            &mut vm,
+            &LaunchOptions {
+                clipboard: true,
+                ..LaunchOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(vm.config.clipboard);
     }
 
     #[test]
@@ -2532,6 +2729,25 @@ mod tests {
                 "last token=<redacted>"
             ]
         );
+    }
+
+    #[test]
+    fn recognizes_linux_bridge_directories() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("br0/bridge")).unwrap();
+        assert!(is_linux_bridge(root.path(), "br0"));
+        assert!(!is_linux_bridge(root.path(), "eth0"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_lookup_requires_an_executable_file() {
+        let root = tempfile::tempdir().unwrap();
+        let command = root.path().join("helper");
+        fs::write(&command, "#!/bin/sh\n").unwrap();
+        assert!(!is_executable_file(&command));
+        fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(is_executable_file(&command));
     }
 
     #[test]

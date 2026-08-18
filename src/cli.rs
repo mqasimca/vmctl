@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap_complete::Shell;
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 pub enum OutputFormat {
@@ -48,6 +49,12 @@ pub enum Command {
     /// List VM configurations and their current state.
     List,
 
+    /// Generate a shell completion script.
+    Completion {
+        #[arg(value_enum, value_name = "SHELL")]
+        shell: Shell,
+    },
+
     /// Show one VM in detail, or list all VMs when no name is given.
     Status {
         #[arg(value_name = "VM")]
@@ -71,6 +78,15 @@ pub enum Command {
         vm: String,
         #[command(flatten)]
         options: LaunchOptions,
+    },
+
+    /// Open an SSH session through a running VM's forwarded port.
+    Ssh {
+        #[arg(value_name = "VM")]
+        vm: String,
+        /// Guest login name (defaults to the current host user).
+        #[arg(short = 'l', long, value_name = "USER")]
+        user: Option<String>,
     },
 
     /// Request a graceful guest shutdown through QMP.
@@ -269,7 +285,7 @@ pub struct GetArgs {
     #[arg(long)]
     pub insecure: bool,
 
-    /// OS, VM name, or `custom` for --create-config.
+    /// OS to inspect or download, or VM name / `custom` for --create-config.
     #[arg(value_name = "OS")]
     pub os: Option<String>,
 
@@ -394,6 +410,10 @@ pub struct LaunchOptions {
     /// Start the display in fullscreen mode.
     #[arg(long, visible_alias = "full-screen", help_heading = "Display")]
     pub fullscreen: bool,
+
+    /// Enable host-guest clipboard sharing with the GTK display.
+    #[arg(long, help_heading = "Display")]
+    pub clipboard: bool,
 
     /// Screen width; requires --height.
     #[arg(long, value_name = "PIXELS", help_heading = "Display")]

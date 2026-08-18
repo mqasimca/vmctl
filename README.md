@@ -11,7 +11,9 @@ vmctl plan VM --output json        # inspect the exact QEMU invocation
 vmctl plan VM --output json --redact # omit sensitive inline values
 vmctl start VM                     # create missing disk/EFI state and start
 vmctl start VM --ssh-access remote # explicitly expose SSH beyond localhost
+vmctl start VM --clipboard         # enable GTK host-guest clipboard sharing
 vmctl start VM --viewer-extra-args --foo value
+vmctl ssh VM --user USER            # connect through the active SSH forward
 vmctl stop VM [--force]            # graceful QMP shutdown, then optional kill
 vmctl kill VM                      # immediately terminate a running VM
 vmctl restart VM [--force]         # stop, then start again
@@ -34,6 +36,7 @@ vmctl doctor VM --output json      # machine-readable VM diagnostics
 vmctl host ignore-msrs-always      # persist KVM MSR handling (Linux)
 vmctl shortcut VM                  # create a desktop launcher
 vmctl get --list                    # list supported OS images
+vmctl get freebsd                   # list current FreeBSD releases and media options
 vmctl get ubuntu 24.04              # download an image and create a VM config
 vmctl get --create-config NAME IMAGE_OR_URL
 ```
@@ -56,7 +59,7 @@ unattended-media creation:
 sudo apt update
 sudo apt install -y \
   build-essential \
-  ca-certificates curl coreutils procps util-linux \
+  ca-certificates curl coreutils openssh-client procps util-linux \
   qemu-system-x86 qemu-system-arm qemu-utils qemu-system-gui \
   qemu-system-modules-spice qemu-system-modules-opengl \
   ovmf qemu-efi-aarch64 \
@@ -83,7 +86,7 @@ the Debian package set rather than the Ubuntu-only module package names:
 sudo apt update
 sudo apt install -y \
   build-essential \
-  ca-certificates curl coreutils procps util-linux \
+  ca-certificates curl coreutils openssh-client procps util-linux \
   qemu-system-x86 qemu-system-arm qemu-utils qemu-system-gui \
   ovmf qemu-efi-aarch64 \
   virt-viewer spice-client-gtk \
@@ -99,7 +102,7 @@ releases, `p7zip-full` can be used instead of `7zip`.
 ```bash
 sudo pacman -Syu --needed \
   base-devel rustup \
-  ca-certificates curl coreutils procps-ng util-linux \
+  ca-certificates curl coreutils openssh procps-ng util-linux \
   qemu-full edk2-ovmf edk2-aarch64 \
   virt-viewer spice-gtk \
   swtpm virtiofsd samba usbutils xdg-user-dirs \
@@ -114,7 +117,7 @@ out and back in:
 sudo usermod -aG kvm "$USER"
 ```
 
-For `guest` commands and clipboard/resize integration, install these inside
+For `guest` commands, GTK clipboard sharing, and SPICE clipboard/resize integration, install these inside
 an Ubuntu or Debian Linux guest (they are not host dependencies):
 
 ```bash
@@ -138,8 +141,18 @@ error.
 `guest shutdown --timeout SECONDS` returns `guest_shutdown_timeout` when QEMU
 does not exit or enter its `shutdown` state before the deadline.
 
+`vmctl ssh VM` opens OpenSSH on the VM's active forwarded port; use
+`--user USER` (or `-l USER`) when the guest login differs from the host user.
+It requires a running VM with user-mode networking and an SSH service inside
+the guest. It does not read or write known-host files, so rebuilt VMs do not
+cause stale-key conflicts. This means the VM host key is not authenticated;
+use plain `ssh` with its explicit port when host-key verification is required.
+
 `qemu-bridge-helper` is supplied by the QEMU packages; bridged networking may
-also require host bridge permissions. `xorriso` is used for Windows
+also require a permitted host bridge. `vmctl doctor VM` verifies that a configured
+bridge exists on Linux and that the helper is installed without changing networking.
+It cannot verify the helper's bridge policy without attempting a VM start.
+`xorriso` is used for Windows
 unattended media and can be replaced by `mkisofs` or `genisoimage`.
 
 These optional programs enable additional features:
@@ -160,7 +173,34 @@ Build from source with a current stable Rust toolchain:
 cargo build --release
 ./target/release/vmctl --help
 ./target/release/vmctl report
+
+# Build and install to ~/.local/bin/vmctl
+make install
 ```
+
+## Shell completion
+
+Generate and install the script for your shell, then open a new terminal:
+
+```bash
+# Bash
+mkdir -p ~/.local/share/bash-completion/completions
+vmctl completion bash > ~/.local/share/bash-completion/completions/vmctl
+
+# Zsh
+mkdir -p ~/.zfunc
+vmctl completion zsh > ~/.zfunc/_vmctl
+# Add these once to ~/.zshrc:
+fpath=(~/.zfunc $fpath)
+autoload -Uz compinit && compinit
+
+# Fish
+mkdir -p ~/.config/fish/completions
+vmctl completion fish > ~/.config/fish/completions/vmctl.fish
+```
+
+`vmctl completion --help` lists every supported shell, including PowerShell
+and Elvish. The command only writes the completion script to standard output.
 
 Use `--dir PATH` for the directory containing `.conf` files and `--state-dir
 PATH` for runtime state. `--output json` is available on command paths that
@@ -257,6 +297,13 @@ provider that requires browser authentication.
 `get --insecure` (or `VMCTL_INSECURE=1`) disables TLS certificate
 verification for URL checks and media downloads. This is unsafe and should be
 used only on a trusted network.
+
+`vmctl get OS` shows image options without downloading. For FreeBSD it queries
+the official release directory for current releases; use
+`vmctl get freebsd RELEASE EDITION` (where EDITION is `disc1` or `dvd1`) to create a VM. GTK clipboard sharing
+is disabled by default: set `clipboard="on"` in a GTK VM configuration or pass
+`vmctl start VM --clipboard`. It requires QEMU 11.1 or newer and the guest
+`spice-vdagent` service.
 
 ## Diagnostics
 

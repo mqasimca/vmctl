@@ -22,6 +22,8 @@ pub struct OsInfo {
     pub editions: &'static str,
 }
 
+const FREEBSD_ISO_IMAGES: &str = "https://download.freebsd.org/releases/amd64/amd64/ISO-IMAGES/";
+
 macro_rules! os {
     ($id:literal, $name:literal, $homepage:literal, $guest:literal, $arch:literal, $releases:literal, $editions:literal) => {
         OsInfo {
@@ -1060,7 +1062,11 @@ fn select_operation(args: &GetArgs) -> Result<Operation> {
             }
         }
         return if args.os.is_some() {
-            Ok(Operation::CreateVm)
+            if args.release_or_input.is_none() && args.edition_or_language.is_none() {
+                Ok(Operation::Show)
+            } else {
+                Ok(Operation::CreateVm)
+            }
         } else {
             Ok(Operation::List)
         };
@@ -1130,32 +1136,106 @@ fn show(args: &GetArgs, output: OutputFormat) -> Result<()> {
             list_json()
         } else {
             for info in OS_CATALOG {
-                print_info(info);
+                print_info(info, None);
             }
             Ok(())
         };
     };
     let info = find_os(os)?;
+    let releases = (info.id == "freebsd").then(freebsd_releases).transpose()?;
     if output == OutputFormat::Json {
+        let mut value = info_json(&info);
+        if let Some(releases) = &releases {
+            value["releases"] = json!(releases);
+        }
         println!(
             "{}",
-            serde_json::to_string_pretty(&info_json(&info)).unwrap_or_default()
+            serde_json::to_string_pretty(&value).unwrap_or_default()
         );
     } else {
-        print_info(&info);
+        print_info(&info, releases.as_deref());
+        if info.id == "freebsd" {
+            println!("  use:           vmctl get freebsd <RELEASE> <disc1|dvd1>");
+        }
     }
     Ok(())
 }
 
-fn print_info(info: &OsInfo) {
+fn print_info(info: &OsInfo, releases: Option<&[String]>) {
     println!("{} ({})", info.name, info.id);
     println!("  homepage:      {}", info.homepage);
     println!("  guest OS:      {}", info.guest_os);
     println!("  architectures: {}", info.architectures.replace(' ', ", "));
-    println!("  releases:      {}", info.releases);
+    println!(
+        "  releases:      {}",
+        releases.map_or_else(|| info.releases.to_string(), |releases| releases.join(", "))
+    );
     if !info.editions.is_empty() {
         println!("  editions:      {}", info.editions);
     }
+}
+
+fn freebsd_releases() -> Result<Vec<String>> {
+    let listing = fetch_text("https://download.freebsd.org/releases/amd64/amd64/ISO-IMAGES/")
+        .map_err(|error| {
+            Error::message(format!(
+                "could not list current FreeBSD releases: {error}; retry later or specify a release, for example: vmctl get freebsd 15.1"
+            ))
+        })?;
+    let mut releases = Vec::new();
+    for release in freebsd_releases_from_listing(&listing) {
+        let listing = fetch_text(&format!("{FREEBSD_ISO_IMAGES}{release}/")).map_err(|error| {
+            Error::message(format!(
+                "could not inspect FreeBSD {release} media: {error}; retry later or specify a release, for example: vmctl get freebsd 15.1 disc1"
+            ))
+        })?;
+        if freebsd_release_is_available(&release, &listing) {
+            releases.push(release);
+        }
+    }
+    if releases.is_empty() {
+        return Err(Error::message(
+            "FreeBSD release listing contained no current RELEASE images; retry later or specify a release, for example: vmctl get freebsd 15.1",
+        ));
+    }
+    Ok(releases)
+}
+
+fn freebsd_releases_from_listing(listing: &str) -> Vec<String> {
+    let listing = listing.to_ascii_lowercase();
+    let mut releases = Vec::new();
+    let mut offset = 0;
+    while let Some(index) = listing[offset..].find("href") {
+        let after = offset + index + "href".len();
+        offset = after;
+        let value = listing[after..].trim_start();
+        let Some(value) = value.strip_prefix('=').map(str::trim_start) else {
+            continue;
+        };
+        let value = match value.chars().next() {
+            Some(quote @ ('\'' | '"')) => value[1..].split(quote).next().unwrap_or_default(),
+            _ => value
+                .split(|character: char| character.is_whitespace() || character == '>')
+                .next()
+                .unwrap_or_default(),
+        };
+        let Some(release) = value.strip_suffix('/') else {
+            continue;
+        };
+        if release.split('.').all(|part| {
+            !part.is_empty() && part.chars().all(|character| character.is_ascii_digit())
+        }) && !releases.iter().any(|value| value == release)
+        {
+            releases.push(release.to_string());
+        }
+    }
+    releases
+}
+
+fn freebsd_release_is_available(release: &str, listing: &str) -> bool {
+    ["disc1", "dvd1"]
+        .iter()
+        .all(|edition| listing.contains(&format!("FreeBSD-{release}-RELEASE-amd64-{edition}.iso")))
 }
 
 fn open_homepage(args: &GetArgs, output: OutputFormat) -> Result<()> {
@@ -1655,7 +1735,7 @@ fn resolve_image(
         ),
         "freebsd" => (
             format!(
-                "https://download.freebsd.org/ftp/releases/amd64/amd64/ISO-IMAGES/{release}/FreeBSD-{release}-RELEASE-amd64-{}.iso",
+                "{FREEBSD_ISO_IMAGES}{release}/FreeBSD-{release}-RELEASE-amd64-{}.iso",
                 edition.as_deref().unwrap_or("disc1")
             ),
             ImageKind::Iso,
@@ -4662,6 +4742,45 @@ mod tests {
     }
 
     #[test]
+    fn get_without_release_shows_os_options() {
+        let args = GetArgs {
+            os: Some("freebsd".to_string()),
+            ..GetArgs::default()
+        };
+        assert_eq!(select_operation(&args).unwrap(), Operation::Show);
+
+        let args = GetArgs {
+            os: Some("freebsd".to_string()),
+            release_or_input: Some("15.1".to_string()),
+            ..GetArgs::default()
+        };
+        assert_eq!(select_operation(&args).unwrap(), Operation::CreateVm);
+    }
+
+    #[test]
+    fn parses_freebsd_release_directories() {
+        let listing = r#"
+            <a href="../">Parent directory</a>
+            <a HREF = '14.4/'>14.4/</a>
+            <a href=15.1/>15.1/</a>
+            <a href="15.1/">15.1/</a>
+            <a href="README.TXT">README.TXT</a>
+        "#;
+        assert_eq!(
+            freebsd_releases_from_listing(listing),
+            vec!["14.4".to_string(), "15.1".to_string()]
+        );
+        assert!(freebsd_release_is_available(
+            "15.1",
+            "FreeBSD-15.1-RELEASE-amd64-disc1.iso FreeBSD-15.1-RELEASE-amd64-dvd1.iso"
+        ));
+        assert!(!freebsd_release_is_available(
+            "14.5",
+            "FreeBSD-14.5-BETA2-amd64-disc1.iso FreeBSD-14.5-BETA2-amd64-dvd1.iso"
+        ));
+    }
+
+    #[test]
     fn recognizes_kde_linux_release_images() {
         assert!(is_kde_linux_iso("kde-linux_202608171234.iso"));
         assert!(!is_kde_linux_iso("kde-linux_latest.iso"));
@@ -4746,6 +4865,8 @@ mod tests {
         let image = resolve_image("ubuntu", "24.04", None, "amd64").unwrap();
         assert_eq!(image.file_name, "ubuntu-24.04-desktop-amd64.iso");
         assert!(image.url.starts_with("https://"));
+        let freebsd = resolve_image("freebsd", "15.1", Some("disc1"), "amd64").unwrap();
+        assert!(freebsd.url.starts_with(FREEBSD_ISO_IMAGES));
         assert_eq!(
             resolve_image("Ubuntu", "24.04", None, "amd64").unwrap().os,
             "ubuntu"

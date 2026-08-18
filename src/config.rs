@@ -36,6 +36,7 @@ pub struct VmConfig {
     pub height: Option<u32>,
     pub max_outputs: Option<u32>,
     pub fullscreen: bool,
+    pub clipboard: bool,
     pub braille: bool,
     pub secureboot: bool,
     pub ssh_port: Option<u16>,
@@ -276,6 +277,7 @@ impl VmConfig {
             height: optional_u32(values, "height", &config_path)?,
             max_outputs: optional_u32(values, "max_outputs", &config_path)?,
             fullscreen: setting_bool(values, "fullscreen", false, &config_path)?,
+            clipboard: setting_bool(values, "clipboard", false, &config_path)?,
             braille,
             secureboot: setting_bool(values, "secureboot", false, &config_path)?,
             ssh_port: optional_port(values, "ssh_port", &config_path)?,
@@ -363,6 +365,12 @@ impl VmConfig {
             &self.display,
             &["gtk", "sdl", "cocoa", "none", "spice", "spice-app"],
         )?;
+        if self.clipboard && self.display != "gtk" {
+            return Err(Error::config(
+                &self.config_path,
+                "clipboard requires display=gtk",
+            ));
+        }
         validate_one_of(
             &self.config_path,
             "viewer",
@@ -944,6 +952,7 @@ tpm="off"
         assert_eq!(vm.config.ssh_port, None);
         assert_eq!(vm.config.serial, "socket");
         assert_eq!(vm.config.viewer, "remote-viewer");
+        assert!(!vm.config.clipboard);
     }
 
     #[test]
@@ -999,6 +1008,15 @@ tpm="off"
                 .to_string()
                 .contains("ssh_port must be greater than zero")
         );
+    }
+
+    #[test]
+    fn rejects_clipboard_without_gtk() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("clipboard.conf");
+        fs::write(&path, "display=sdl\nclipboard=on\n").unwrap();
+        let error = load_vm(root.path(), root.path(), path).unwrap_err();
+        assert!(error.to_string().contains("clipboard requires display=gtk"));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 CARGO ?= cargo
 
-.PHONY: all fmt check test lint doc build verify clean
+.PHONY: all fmt check test lint doc build install verify clean
 
 all: verify
 
@@ -22,6 +22,10 @@ doc:
 
 build:
 	$(CARGO) build --release
+
+install: build
+	mkdir -p "$(HOME)/.local/bin"
+	install -m 755 target/release/vmctl "$(HOME)/.local/bin/vmctl"
 
 verify: fmt check test lint doc build
 

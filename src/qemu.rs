@@ -1158,7 +1158,8 @@ pub fn build_plan(vm: &Vm, host: &QemuPlanContext, prepare_firmware: bool) -> Re
     add_share_args(&mut args, vm, host);
 
     let spice = matches!(display_config.display.as_str(), "none" | "spice");
-    if vm.config.guest_agent || spice {
+    let gtk_clipboard = display_config.display == "gtk" && display_config.clipboard;
+    if vm.config.guest_agent || spice || gtk_clipboard {
         args.extend(["-device".to_string(), "virtio-serial-pci".to_string()]);
     }
     if vm.config.guest_agent {
@@ -1210,6 +1211,14 @@ pub fn build_plan(vm: &Vm, host: &QemuPlanContext, prepare_firmware: bool) -> Re
                 "ccid-card-passthru,chardev=ccid".to_string(),
             ]);
         }
+    }
+    if gtk_clipboard {
+        args.extend([
+            "-chardev".to_string(),
+            "qemu-vdagent,id=vdagent0,name=vdagent,clipboard=on".to_string(),
+            "-device".to_string(),
+            "virtserialport,chardev=vdagent0,name=com.redhat.spice.0".to_string(),
+        ]);
     }
 
     if vm.config.tpm {
@@ -1729,6 +1738,21 @@ fn display_args(
     config: &VmConfig,
     host: &QemuPlanContext,
 ) -> Result<(String, String, Option<u16>)> {
+    if config.clipboard && config.display != "gtk" {
+        return Err(Error::message(
+            "clipboard requires the GTK display backend; select --display gtk on a host where GTK is available",
+        ));
+    }
+    if config.clipboard && !qemu_supports_gtk_clipboard(&host.qemu_binary) {
+        return Err(Error::message(
+            "GTK clipboard sharing requires QEMU 11.1.0 or newer",
+        ));
+    }
+    if config.clipboard && !qemu_supports_vdagent(&host.qemu_binary) {
+        return Err(Error::message(
+            "GTK clipboard sharing requires QEMU built with qemu-vdagent support; install QEMU's SPICE module",
+        ));
+    }
     if config.display == "cocoa" && host.host_os != "macos" {
         return Err(Error::message(
             "display mode 'cocoa' is only supported on macOS",
@@ -1824,7 +1848,14 @@ fn display_args(
             spice_port,
         ),
         "gtk" => (
-            format!("gtk,grab-on-hover=on,zoom-to-fit=off,gl={gl}{fullscreen}"),
+            format!(
+                "gtk{},grab-on-hover=on,zoom-to-fit=off,gl={gl}{fullscreen}",
+                if config.clipboard {
+                    ",clipboard=on"
+                } else {
+                    ""
+                }
+            ),
             video,
             None,
         ),
@@ -1903,12 +1934,7 @@ fn add_network_args(
         args.extend(["-nic".to_string(), "none".to_string()]);
         return Ok(());
     }
-    let bridge = vm.config.bridge.as_deref().or_else(|| {
-        (!vm.config.network.is_empty()
-            && !vm.config.network.eq_ignore_ascii_case("restrict")
-            && !vm.config.network.eq_ignore_ascii_case("user"))
-        .then_some(vm.config.network.as_str())
-    });
+    let bridge = configured_bridge(&vm.config);
     if let Some(bridge) = bridge {
         let helper = bridge_helper.ok_or_else(|| {
             Error::message(
@@ -2096,9 +2122,21 @@ fn add_audio_args(args: &mut Vec<String>, config: &VmConfig, driver: Option<&str
     }
 }
 
+pub(crate) fn configured_bridge(config: &VmConfig) -> Option<&str> {
+    if config.offline || config.network.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    config.bridge.as_deref().or_else(|| {
+        (!config.network.is_empty()
+            && !config.network.eq_ignore_ascii_case("restrict")
+            && !config.network.eq_ignore_ascii_case("user"))
+        .then_some(config.network.as_str())
+    })
+}
+
 fn uses_user_network(config: &VmConfig) -> bool {
     !config.offline
-        && config.bridge.is_none()
+        && configured_bridge(config).is_none()
         && (config.network.is_empty()
             || config.network.eq_ignore_ascii_case("restrict")
             || config.network.eq_ignore_ascii_case("user"))
@@ -4564,6 +4602,22 @@ fn qemu_version_supported((major, minor, _patch): (u32, u32, u32)) -> bool {
     major > 6 || (major == 6 && minor >= 1)
 }
 
+fn qemu_supports_gtk_clipboard(binary: &str) -> bool {
+    qemu_help_output(binary, &["-version"])
+        .as_deref()
+        .and_then(|output| qemu_version(output.as_bytes()))
+        .is_some_and(qemu_version_supports_gtk_clipboard)
+}
+
+fn qemu_version_supports_gtk_clipboard(version: (u32, u32, u32)) -> bool {
+    version >= (11, 1, 0)
+}
+
+fn qemu_supports_vdagent(binary: &str) -> bool {
+    qemu_help_output(binary, &["-chardev", "help"])
+        .is_some_and(|output| output.contains("qemu-vdagent"))
+}
+
 fn command_available(command: &str) -> bool {
     find_executable(command)
         .map(Command::new)
@@ -4582,9 +4636,26 @@ fn find_executable(command: &str) -> Option<String> {
         names
             .iter()
             .map(|name| directory.join(name))
-            .find(|candidate| candidate.is_file())
+            .find(|candidate| is_executable_file(candidate))
             .map(|candidate| candidate.to_string_lossy().into_owned())
     })
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 fn executable_names(command: &str) -> Vec<String> {
@@ -5511,6 +5582,23 @@ mod tests {
         assert!(qemu_version_supported((10, 0, 0)));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn executable_lookup_rejects_non_executable_files() {
+        let root = tempdir().unwrap();
+        let command = root.path().join("qemu-system-test");
+        fs::write(&command, "#!/bin/sh\n").unwrap();
+        assert!(!is_executable_file(&command));
+        fs::set_permissions(&command, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(is_executable_file(&command));
+    }
+
+    #[test]
+    fn gtk_clipboard_requires_qemu_11_1() {
+        assert!(qemu_version_supports_gtk_clipboard((11, 1, 0)));
+        assert!(!qemu_version_supports_gtk_clipboard((11, 0, 9)));
+    }
+
     #[test]
     fn monitor_output_drops_terminal_control_sequences() {
         assert_eq!(
@@ -5946,6 +6034,7 @@ mod tests {
         };
         let plan = build_plan(&vm, &host, false).unwrap();
         assert!(uses_user_network(&vm.config));
+        assert_eq!(configured_bridge(&vm.config), None);
         assert_eq!(plan.ssh_port, Some(22444));
         assert!(
             plan.args
@@ -5987,6 +6076,7 @@ mod tests {
         };
 
         let plan = build_plan(&vm, &host, false).unwrap();
+        assert_eq!(configured_bridge(&vm.config), Some("br0"));
         assert!(plan.args.iter().any(|arg| {
             arg == "bridge,br=br0,helper=/usr/lib/qemu/qemu-bridge-helper,model=virtio-net-pci"
         }));
@@ -5998,6 +6088,47 @@ mod tests {
                 .to_string()
                 .contains("bridged networking requires qemu-bridge-helper")
         );
+    }
+
+    #[test]
+    fn gtk_clipboard_is_explicit_in_the_display_plan() {
+        let root = tempdir().unwrap();
+        let config_path = root.path().join("clipboard.conf");
+        fs::write(
+            &config_path,
+            "boot=legacy\ndisplay=gtk\nclipboard=on\nnetwork=none\npublic_dir=none\n",
+        )
+        .unwrap();
+        let vm = load_vm(root.path(), root.path(), config_path).unwrap();
+        let host = QemuPlanContext {
+            qemu_binary: "qemu-system-x86_64".to_string(),
+            host_os: "linux".to_string(),
+            accelerator: "tcg".to_string(),
+            cpu_cores: 2,
+            ram: "4G".to_string(),
+            virtio_vga_gl: false,
+            usb_redirection: false,
+            smartcard: false,
+            smbd: false,
+            audio_driver: None,
+            username: "tester".to_string(),
+            bridge_helper: None,
+            virtiofsd: None,
+            virtiofs_device: false,
+            ssh_port: None,
+            spice_port: Some(5930),
+        };
+
+        match build_plan(&vm, &host, false) {
+            Ok(plan) => {
+                assert!(plan.args.iter().any(|arg| arg.contains("clipboard=on")));
+                assert!(plan.args.iter().any(|arg| arg.contains("qemu-vdagent")));
+            }
+            Err(error) => assert!(
+                error.to_string().contains("QEMU 11.1.0")
+                    || error.to_string().contains("qemu-vdagent")
+            ),
+        }
     }
 
     #[test]
