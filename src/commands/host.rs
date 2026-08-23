@@ -30,21 +30,19 @@ pub(super) fn configure_ignore_msrs(output: OutputFormat, report: bool) -> Resul
     };
     let setting = "options kvm ignore_msrs=Y";
     let already_configured = existing.lines().any(|line| line.trim() == setting);
-    let used_sudo = if already_configured {
-        false
-    } else {
+    if !already_configured {
         let contents = if existing.is_empty() {
             format!("{setting}\n")
         } else {
             format!("{}\n{setting}\n", existing.trim_end())
         };
-        write_host_file(path, &contents)?
-    };
+        write_host_file(path, &contents)?;
+    }
 
     let initramfs = if already_configured {
         "already configured"
     } else if let Some(command) = find_command("update-initramfs") {
-        let mut process = if used_sudo {
+        let mut process = if host_needs_sudo() {
             let mut process = ProcessCommand::new("sudo");
             process.arg(&command);
             process
@@ -60,7 +58,7 @@ pub(super) fn configure_ignore_msrs(output: OutputFormat, report: bool) -> Resul
         }
         "rebuilt"
     } else if let Some(command) = find_command("mkinitcpio") {
-        let mut process = if used_sudo {
+        let mut process = if host_needs_sudo() {
             let mut process = ProcessCommand::new("sudo");
             process.arg(&command);
             process
@@ -93,6 +91,22 @@ pub(super) fn configure_ignore_msrs(output: OutputFormat, report: bool) -> Resul
         println!("initramfs: {initramfs}");
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn host_needs_sudo() -> bool {
+    // Safe: querying the effective UID has no side effects.
+    needs_sudo_for_uid(unsafe { libc::geteuid() })
+}
+
+#[cfg(not(unix))]
+fn host_needs_sudo() -> bool {
+    false
+}
+
+#[cfg(any(unix, test))]
+fn needs_sudo_for_uid(effective_uid: u32) -> bool {
+    effective_uid != 0
 }
 
 pub(super) fn write_host_file(path: &Path, contents: &str) -> Result<bool> {
@@ -167,5 +181,16 @@ pub(super) fn is_executable_file(path: &Path) -> bool {
     #[cfg(not(unix))]
     {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_root_host_actions_use_sudo() {
+        assert!(!needs_sudo_for_uid(0));
+        assert!(needs_sudo_for_uid(1));
     }
 }

@@ -390,14 +390,9 @@ pub(super) fn open_homepage(args: &GetArgs, output: OutputFormat) -> Result<()> 
         return Err(Error::message("--open-homepage accepts only an OS"));
     }
     let info = find_os(os)?;
-    let command = if cfg!(target_os = "macos") {
-        "open"
-    } else if cfg!(target_os = "windows") {
-        "start"
-    } else {
-        "xdg-open"
-    };
+    let (command, arguments) = homepage_opener();
     Command::new(command)
+        .args(arguments)
         .arg(info.homepage)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -412,6 +407,16 @@ pub(super) fn open_homepage(args: &GetArgs, output: OutputFormat) -> Result<()> 
         println!("Opened {}", info.homepage);
     }
     Ok(())
+}
+
+pub(super) fn homepage_opener() -> (&'static str, &'static [&'static str]) {
+    if cfg!(target_os = "macos") {
+        ("open", &[])
+    } else if cfg!(target_os = "windows") {
+        ("cmd", &["/C", "start", ""])
+    } else {
+        ("xdg-open", &[])
+    }
 }
 
 pub(super) fn print_images(args: &GetArgs, output: OutputFormat) -> Result<()> {

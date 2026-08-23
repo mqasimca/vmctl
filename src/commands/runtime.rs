@@ -2,24 +2,22 @@ use super::*;
 
 pub(super) fn write_pid(vm: &Vm, pid: i32) -> Result<()> {
     let path = vm.paths.pid_file();
-    let temporary = path.with_extension("pid.tmp");
     let identity = qemu::process_identity(pid).map_or_else(
         || format!("{pid}\n"),
         |identity| format!("{pid} {identity}\n"),
     );
-    fs::write(&temporary, identity).map_err(|error| Error::io(temporary.display(), error))?;
-    fs::rename(&temporary, &path).map_err(|error| Error::io(path.display(), error))
+    qemu::write_atomic_file(&path, identity.as_bytes())
 }
 
 pub(super) fn apply_cpu_pinning(pid: i32, pinning: &str) -> Result<()> {
-    let status = ProcessCommand::new("taskset")
-        .args(["-cp", pinning, &pid.to_string()])
-        .status()
+    let output = ProcessCommand::new("taskset")
+        .args(["-acp", pinning, &pid.to_string()])
+        .output()
         .map_err(|error| Error::command_unavailable("taskset", error))?;
-    if status.success() {
+    if output.status.success() {
         Ok(())
     } else {
-        Err(Error::command_failed_status("taskset", status))
+        Err(Error::command_failed_status("taskset", output.status))
     }
 }
 
@@ -186,7 +184,14 @@ pub(super) fn command_version(command: &str) -> Option<String> {
 }
 
 pub(super) fn desktop_quote(path: &Path) -> String {
-    let value = path.display().to_string();
+    quote_desktop_value(path.display().to_string())
+}
+
+pub(super) fn desktop_exec_quote(path: &Path) -> String {
+    quote_desktop_value(path.display().to_string().replace('%', "%%"))
+}
+
+fn quote_desktop_value(value: String) -> String {
     if value
         .chars()
         .all(|character| character.is_ascii_alphanumeric() || "_./:-".contains(character))
@@ -217,19 +222,15 @@ pub(super) fn launch_viewer(vm: &Vm, plan: &qemu::QemuPlan, quiet: bool) -> bool
 pub(super) fn start_viewer(vm: &Vm, viewer: &str, port: Option<u16>) -> Result<()> {
     let mut command = ProcessCommand::new(viewer);
     if let Some(port) = port {
+        let host = connect_host(spice_address(&vm.config));
         if viewer == "spicy" {
-            if spice_address(&vm.config) == "127.0.0.1" {
+            if host == "127.0.0.1" {
                 command.args(["--port", &port.to_string()]);
             } else {
-                command.args([
-                    "--host",
-                    spice_address(&vm.config),
-                    "--port",
-                    &port.to_string(),
-                ]);
+                command.args(["--host", host, "--port", &port.to_string()]);
             }
         } else {
-            command.arg(format!("spice://{}:{port}", spice_address(&vm.config)));
+            command.arg(spice_tcp_uri(host, port));
         }
     } else {
         let uri = format!("spice+unix://{}", vm.paths.spice_socket().display());
@@ -250,15 +251,33 @@ pub(super) fn start_viewer(vm: &Vm, viewer: &str, port: Option<u16>) -> Result<(
     })
 }
 
+pub(super) fn spice_tcp_uri(host: &str, port: u16) -> String {
+    if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("spice://[{host}]:{port}")
+    } else {
+        format!("spice://{host}:{port}")
+    }
+}
+
 pub(super) fn reconnect_viewer(vm: &Vm, quiet: bool) -> bool {
-    if !matches!(vm.config.display.as_str(), "none" | "spice" | "spice-app")
-        || vm.config.viewer == "none"
-    {
+    if vm.config.viewer == "none" {
         return false;
     }
     let mut vm = vm.clone();
-    if let Some(port) = runtime_port(&vm.paths.state_dir.join("ports"), "spice") {
-        vm.config.spice_port = Some(port);
+    let Ok((saved, listener)) = runtime_listener(&vm.paths.state_dir.join("ports"), "spice") else {
+        return false;
+    };
+    if saved {
+        let port = listener.map(|(port, host)| {
+            if let Some(host) = host {
+                vm.config.access = connect_host(&host).to_string();
+            }
+            port
+        });
+        if port.is_none() && !vm.paths.spice_socket().exists() {
+            return false;
+        }
+        return start_viewer(&vm, &vm.config.viewer, port).is_ok();
     }
     let Ok(host) = HostCapabilities::detect(&vm.config) else {
         return false;
@@ -269,19 +288,66 @@ pub(super) fn reconnect_viewer(vm: &Vm, quiet: bool) -> bool {
     launch_viewer(&vm, &plan, quiet)
 }
 
-pub(super) fn runtime_port(path: &Path, wanted: &str) -> Option<u16> {
-    fs::read_to_string(path).ok()?.lines().find_map(|line| {
-        let (name, port) = line.split_once(',')?;
-        (name == wanted).then(|| port.parse().ok()).flatten()
-    })
+pub(super) type RuntimeEndpoint = (u16, Option<String>);
+
+pub(super) fn runtime_listener(
+    path: &Path,
+    wanted: &str,
+) -> Result<(bool, Option<RuntimeEndpoint>)> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((false, None)),
+        Err(error) => return Err(Error::io(path.display(), error)),
+    };
+    let listener = contents.lines().find_map(|line| {
+        let mut fields = line.splitn(3, ',');
+        let name = fields.next()?;
+        let port = fields.next()?.parse().ok()?;
+        (name == wanted).then(|| {
+            (
+                port,
+                fields
+                    .next()
+                    .filter(|host| !host.is_empty())
+                    .map(str::to_string),
+            )
+        })
+    });
+    Ok((true, listener))
+}
+
+pub(super) fn connect_host(host: &str) -> &str {
+    match host {
+        "::" => "::1",
+        "" | "local" | "remote" | "0.0.0.0" => "127.0.0.1",
+        host => host,
+    }
 }
 
 pub(super) fn effective_ssh_port(vm: &Vm) -> Result<Option<u16>> {
     if matches!(vm.state()?, VmState::Running(_)) {
-        Ok(runtime_port(&vm.paths.state_dir.join("ports"), "ssh").or(vm.config.ssh_port))
+        let (saved, listener) = runtime_listener(&vm.paths.state_dir.join("ports"), "ssh")?;
+        Ok(if saved {
+            listener.map(|(port, _)| port)
+        } else {
+            vm.config.ssh_port
+        })
     } else {
         Ok(vm.config.ssh_port)
     }
+}
+
+pub(super) fn runtime_ssh_host(vm: &Vm) -> Result<Option<String>> {
+    let (saved, listener) = runtime_listener(&vm.paths.state_dir.join("ports"), "ssh")?;
+    if !saved {
+        return Ok(None);
+    }
+    Ok(listener.map(|(_, host)| {
+        host.as_deref()
+            .map(connect_host)
+            .unwrap_or_else(|| ssh_connect_host(&vm.config))
+            .to_string()
+    }))
 }
 
 pub(super) fn vm_ssh_options() -> [String; 8] {

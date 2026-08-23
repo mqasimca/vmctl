@@ -42,6 +42,21 @@ pub(super) fn add_network_args(
         args.extend(["-nic".to_string(), "none".to_string()]);
         return Ok(());
     }
+    if !vm.config.port_forwards.is_empty() && !uses_port_forwarding_network(&vm.config) {
+        return Err(Error::message(
+            "port forwards require network=user, network=restrict, or network=passt",
+        ));
+    }
+    if ssh_port.is_some()
+        && uses_user_network(&vm.config)
+        && ssh_address(&vm.config)
+            .parse::<std::net::Ipv4Addr>()
+            .is_err()
+    {
+        return Err(Error::message(
+            "QEMU user networking requires ssh_access to resolve to a numeric IPv4 address",
+        ));
+    }
 
     let net_device = match vm.config.guest_os.as_str() {
         "freedos" => "pcnet",

@@ -28,13 +28,18 @@ pub(super) fn list_vms(dirs: &Dirs, output: OutputFormat) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn status_vms(dirs: &Dirs, name: Option<&str>, output: OutputFormat) -> Result<()> {
+pub(super) fn status_vms(
+    dirs: &Dirs,
+    name: Option<&str>,
+    live: bool,
+    output: OutputFormat,
+) -> Result<()> {
     if let Some(name) = name {
         let vm = find(&dirs.vm_dir, &dirs.state_root, name)?;
         if output == OutputFormat::Json {
-            print_json_success(vm_status(&vm)?);
+            print_json_success(vm_status(&vm, live)?);
         } else {
-            print_vm_status(&vm)?;
+            print_vm_status(&vm, live)?;
         }
         Ok(())
     } else {

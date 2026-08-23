@@ -2,7 +2,17 @@ use super::*;
 
 pub(super) fn add_storage_args(args: &mut Vec<String>, vm: &Vm) -> Result<()> {
     let config = &vm.config;
-    let optimisations = "discard=unmap,detect-zeroes=unmap,cache=writeback,aio=threads";
+    let optimisations = format!(
+        "discard={},detect-zeroes={},cache={},aio={}",
+        config.discard,
+        if config.discard == "unmap" {
+            "unmap"
+        } else {
+            "off"
+        },
+        config.disk_cache,
+        config.disk_aio,
+    );
 
     if config.guest_os == "macos" {
         let parent = config.disk_img.parent().unwrap_or_else(|| Path::new("."));
@@ -39,7 +49,7 @@ pub(super) fn add_storage_args(args: &mut Vec<String>, vm: &Vm) -> Result<()> {
             ) => "virtio-blk-pci",
             _ => "ide-hd,bus=ahci.2",
         };
-        add_system_disk(args, config, device, optimisations)?;
+        add_system_disk(args, config, device, &optimisations)?;
         return Ok(());
     }
 
@@ -112,21 +122,16 @@ pub(super) fn add_storage_args(args: &mut Vec<String>, vm: &Vm) -> Result<()> {
             "virtio-blk-pci,drive=BootDisk".to_string(),
         ]);
     }
-    if config.guest_os == "freedos" && config.iso.is_some() {
-        args.extend(["-boot".to_string(), "order=dc".to_string()]);
-    }
-    if config.guest_os == "kolibrios" && config.iso.is_some() {
-        args.extend(["-boot".to_string(), "order=d".to_string()]);
-    }
 
     if config.guest_os == "reactos" {
         add(
             args,
             "-drive",
             format!(
-                "if=ide,index=0,media=disk,format={},file={}",
+                "if=ide,index=0,media=disk,format={},file={},{}",
                 config.disk_format,
-                qemu_path(&config.disk_img)
+                qemu_path(&config.disk_img),
+                optimisations,
             ),
         );
         return Ok(());
@@ -146,7 +151,7 @@ pub(super) fn add_storage_args(args: &mut Vec<String>, vm: &Vm) -> Result<()> {
         _ if config.arch == "aarch64" => "virtio-blk-pci,bootindex=2",
         _ => "virtio-blk-pci",
     };
-    add_system_disk(args, config, device, optimisations)
+    add_system_disk(args, config, device, &optimisations)
 }
 
 pub(super) fn add_system_disk(

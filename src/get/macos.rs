@@ -72,7 +72,7 @@ pub(super) fn apple_session() -> Result<String> {
             "--dump-header",
             "-",
             "--output",
-            "/dev/null",
+            NULL_DEVICE,
             "-H",
             "Host: osrecovery.apple.com",
             "-H",
@@ -166,49 +166,25 @@ pub(super) fn curl_request(
         .map_err(|error| Error::message(format!("invalid UTF-8 from {url}: {error}")))
 }
 
-pub(super) fn download_file_with_headers(
-    url: &str,
-    destination: &Path,
-    headers: &[String],
-    insecure: bool,
-) -> Result<()> {
-    if fs::symlink_metadata(destination)
-        .ok()
-        .is_some_and(|metadata| metadata.file_type().is_symlink())
-    {
-        return Err(Error::message(format!(
-            "refusing to download through symlink {}",
-            destination.display()
-        )));
-    }
-    let parent = destination
-        .parent()
-        .ok_or_else(|| Error::message("download destination has no parent directory"))?;
-    fs::create_dir_all(parent).map_err(|error| Error::io(parent.display(), error))?;
-    let mut command = Command::new("curl");
-    command.args([
-        "--disable",
-        "--fail",
-        "--location",
-        "--continue-at",
-        "-",
-        "--output",
-    ]);
-    command.args(curl_security_args(insecure));
-    command.arg(destination);
-    for header in headers {
-        command.args(["--header", header]);
-    }
-    let status = command
-        .arg("--")
-        .arg(url)
+pub(super) fn convert_recovery_image(source: &Path, destination: &Path) -> Result<()> {
+    let (temporary, file) = stage_new_file(destination)?;
+    drop(file);
+    let status = Command::new("qemu-img")
+        .arg("convert")
+        .arg(source)
+        .args(["-O", "raw"])
+        .arg(&temporary)
         .status()
-        .map_err(|error| Error::command_unavailable("curl", error))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(Error::command_failed_status("curl", status))
+        .map_err(|error| Error::command_unavailable("qemu-img", error));
+    let result = match status {
+        Ok(status) if status.success() => commit_new_file(&temporary, destination),
+        Ok(status) => Err(Error::command_failed_status("qemu-img convert", status)),
+        Err(error) => Err(error),
+    };
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
     }
+    result
 }
 
 pub(super) fn download_macos(
@@ -246,86 +222,94 @@ pub(super) fn download_macos(
             root.join(format!("{name}.conf")).display()
         )));
     }
-    fs::create_dir_all(&target_dir).map_err(|error| Error::io(target_dir.display(), error))?;
-    let recovery = fetch_macos_recovery(release)?;
-    let recovery_dmg = target_dir.join("RecoveryImage.dmg");
-    let recovery_img = target_dir.join("RecoveryImage.img");
-    let dmg_headers = vec![
-        "Host: oscdn.apple.com".to_string(),
-        "Connection: close".to_string(),
-        "User-Agent: InternetRecovery/1.0".to_string(),
-        format!("Cookie: AssetToken={}", recovery.asset_token),
-    ];
-    let chunk_headers = vec![
-        "Host: oscdn.apple.com".to_string(),
-        "Connection: close".to_string(),
-        "User-Agent: InternetRecovery/1.0".to_string(),
-        format!("Cookie: AssetToken={}", recovery.chunklist_token),
-    ];
-    download_file_with_headers(&recovery.url, &recovery_dmg, &dmg_headers, args.insecure)?;
-    download_file_with_headers(
-        &recovery.chunklist_url,
-        &target_dir.join("RecoveryImage.chunklist"),
-        &chunk_headers,
-        args.insecure,
-    )?;
-    if command_exists("chunkcheck") {
-        let status = Command::new("chunkcheck")
-            .arg(&target_dir)
-            .status()
-            .map_err(|error| Error::command_unavailable("chunkcheck", error))?;
-        if !status.success() {
-            eprintln!("vmctl: warning: Apple recovery chunk verification failed");
+    let target_dir_existed = target_dir.exists();
+    let provision = (|| {
+        fs::create_dir_all(&target_dir).map_err(|error| Error::io(target_dir.display(), error))?;
+        let recovery_dmg = target_dir.join("RecoveryImage.dmg");
+        let recovery_img = target_dir.join("RecoveryImage.img");
+        let recovery_chunklist = target_dir.join("RecoveryImage.chunklist");
+        for destination in [&recovery_dmg, &recovery_img, &recovery_chunklist] {
+            ensure_new_file(destination)?;
         }
-    }
-    if !recovery_img.exists() {
-        let status = Command::new("qemu-img")
-            .args([
-                "convert",
-                recovery_dmg.to_string_lossy().as_ref(),
-                "-O",
-                "raw",
-                recovery_img.to_string_lossy().as_ref(),
-            ])
-            .status()
-            .map_err(|error| Error::command_unavailable("qemu-img", error))?;
-        if !status.success() {
-            return Err(Error::command_failed_status("qemu-img convert", status));
+        let recovery = fetch_macos_recovery(release)?;
+        let dmg_headers = vec![
+            "Host: oscdn.apple.com".to_string(),
+            "Connection: close".to_string(),
+            "User-Agent: InternetRecovery/1.0".to_string(),
+            format!("Cookie: AssetToken={}", recovery.asset_token),
+        ];
+        let chunk_headers = vec![
+            "Host: oscdn.apple.com".to_string(),
+            "Connection: close".to_string(),
+            "User-Agent: InternetRecovery/1.0".to_string(),
+            format!("Cookie: AssetToken={}", recovery.chunklist_token),
+        ];
+        download_file_with_headers(&recovery.url, &recovery_dmg, &dmg_headers, args.insecure)?;
+        download_file_with_headers(
+            &recovery.chunklist_url,
+            &recovery_chunklist,
+            &chunk_headers,
+            args.insecure,
+        )?;
+        if command_exists("chunkcheck") {
+            let status = Command::new("chunkcheck")
+                .arg(&target_dir)
+                .status()
+                .map_err(|error| Error::command_unavailable("chunkcheck", error))?;
+            if !status.success() {
+                eprintln!("vmctl: warning: Apple recovery chunk verification failed");
+            }
         }
-    }
-    let _ = fs::remove_file(&recovery_dmg);
-    let _ = fs::remove_file(target_dir.join("RecoveryImage.chunklist"));
-    if create_config {
-        let commit = "da4b23b5e92c5b939568700034367e8b7649fe90";
-        for (file, url) in [
-            (
-                "OpenCore.qcow2",
-                format!("https://github.com/kholia/OSX-KVM/raw/{commit}/OpenCore/OpenCore.qcow2"),
-            ),
-            (
-                "OVMF_CODE.fd",
-                format!("https://github.com/kholia/OSX-KVM/raw/{commit}/OVMF_CODE.fd"),
-            ),
-            (
-                "OVMF_VARS-1920x1080.fd",
-                format!("https://github.com/kholia/OSX-KVM/raw/{commit}/OVMF_VARS-1920x1080.fd"),
-            ),
-        ] {
-            download_file(&url, &target_dir.join(file), args.insecure)?;
+        convert_recovery_image(&recovery_dmg, &recovery_img)?;
+        let _ = fs::remove_file(&recovery_dmg);
+        let _ = fs::remove_file(&recovery_chunklist);
+        if create_config {
+            let commit = "da4b23b5e92c5b939568700034367e8b7649fe90";
+            for (file, url) in [
+                (
+                    "OpenCore.qcow2",
+                    format!(
+                        "https://github.com/kholia/OSX-KVM/raw/{commit}/OpenCore/OpenCore.qcow2"
+                    ),
+                ),
+                (
+                    "OVMF_CODE.fd",
+                    format!("https://github.com/kholia/OSX-KVM/raw/{commit}/OVMF_CODE.fd"),
+                ),
+                (
+                    "OVMF_VARS-1920x1080.fd",
+                    format!(
+                        "https://github.com/kholia/OSX-KVM/raw/{commit}/OVMF_VARS-1920x1080.fd"
+                    ),
+                ),
+            ] {
+                download_file(&url, &target_dir.join(file), args.insecure)?;
+            }
         }
-    }
-    let config_path = if create_config {
-        Some(write_vm_config(
-            &root,
-            &name,
-            "macos",
-            release,
-            None,
-            architecture,
-            &recovery_img,
-        )?)
-    } else {
-        None
+        let config_path = if create_config {
+            Some(write_vm_config(
+                &root,
+                &name,
+                "macos",
+                release,
+                None,
+                architecture,
+                &recovery_img,
+                VmResources::default(),
+            )?)
+        } else {
+            None
+        };
+        Ok((recovery_img, config_path))
+    })();
+    let (recovery_img, config_path) = match provision {
+        Ok(created) => created,
+        Err(error) => {
+            if create_config && !target_dir_existed {
+                let _ = fs::remove_dir_all(&target_dir);
+            }
+            return Err(error);
+        }
     };
     let result = json!({
         "os": "macos",

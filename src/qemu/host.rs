@@ -40,7 +40,7 @@ pub(crate) fn render_node() -> Option<PathBuf> {
     nodes.into_iter().next().map(|(_, path)| path)
 }
 
-pub(super) fn default_cpu_cores() -> u32 {
+pub(crate) fn default_cpu_cores() -> u32 {
     let host = std::thread::available_parallelism()
         .map(|parallelism| parallelism.get() as u32)
         .unwrap_or(2);
@@ -74,7 +74,7 @@ pub(super) fn default_ram() -> String {
                 .filter(|output| output.status.success())
                 .and_then(|output| String::from_utf8(output.stdout).ok())
                 .and_then(|value| value.trim().parse::<u64>().ok())
-                .map(|bytes| bytes / 1024 / 1024 / 1024)
+                .map(|bytes| bytes / 1024)
         })
         .map(|kib| kib / 1024 / 1024)
         .unwrap_or(4);
@@ -89,15 +89,18 @@ pub(super) fn default_ram() -> String {
     }
 }
 
-pub(super) fn find_free_port(start: u16) -> Result<u16> {
-    for port in start..=start.saturating_add(9) {
+pub(super) fn find_free_port(start: u16, reserved: &[u16]) -> Result<u16> {
+    let end = start.saturating_add(9);
+    for port in start..=end {
+        if reserved.contains(&port) {
+            continue;
+        }
         if TcpListener::bind(("127.0.0.1", port)).is_ok() {
             return Ok(port);
         }
     }
     Err(Error::message(format!(
-        "no free port found in {start}-{}",
-        start + 9
+        "no free port found in {start}-{end}",
     )))
 }
 

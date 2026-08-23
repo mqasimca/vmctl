@@ -227,7 +227,7 @@ pub(super) fn fetch_redirect(url: &str) -> Result<String> {
             "--show-error",
             "--head",
             "--output",
-            "/dev/null",
+            NULL_DEVICE,
             "--write-out",
             "%{url_effective}",
             "--",

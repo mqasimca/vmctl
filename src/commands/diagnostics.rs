@@ -31,16 +31,31 @@ pub(super) fn logs_vm(
 
 pub(super) fn read_log_lines(path: &Path, max_lines: usize) -> Result<(Vec<String>, bool)> {
     const MAX_LOG_BYTES: usize = 1024 * 1024;
-    let bytes = fs::read(path).map_err(|error| Error::io(path.display(), error))?;
-    let byte_start = bytes.len().saturating_sub(MAX_LOG_BYTES);
-    let text = String::from_utf8_lossy(&bytes[byte_start..]);
+    let (bytes, byte_truncated) = read_file_tail(path, MAX_LOG_BYTES)?;
+    let text = String::from_utf8_lossy(&bytes);
     let mut lines: Vec<String> = text.lines().map(redact_diagnostic).collect();
     let line_truncated = lines.len() > max_lines;
     if line_truncated {
         let keep_from = lines.len() - max_lines;
         lines.drain(..keep_from);
     }
-    Ok((lines, byte_start != 0 || line_truncated))
+    Ok((lines, byte_truncated || line_truncated))
+}
+
+pub(super) fn read_file_tail(path: &Path, max_bytes: usize) -> Result<(Vec<u8>, bool)> {
+    let mut file = File::open(path).map_err(|error| Error::io(path.display(), error))?;
+    let length = file
+        .metadata()
+        .map_err(|error| Error::io(path.display(), error))?
+        .len();
+    let start = length.saturating_sub(max_bytes as u64);
+    file.seek(SeekFrom::Start(start))
+        .map_err(|error| Error::io(path.display(), error))?;
+    let mut bytes = Vec::with_capacity((length - start) as usize);
+    file.take(max_bytes as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| Error::io(path.display(), error))?;
+    Ok((bytes, start != 0))
 }
 
 pub(super) fn validate_usb_devices(vm: &Vm) -> Result<()> {

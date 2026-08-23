@@ -79,6 +79,7 @@ pub(super) fn download_cached_image(
 }
 
 pub(super) fn create_cached_vm(args: &CreateArgs, dirs: &Dirs, output: OutputFormat) -> Result<()> {
+    let resources = VmResources::from_create(args)?;
     let source = cached_source(&dirs.vm_dir, &args.image)?;
     if source.cloud {
         return create_cached_cloud_vm(args, dirs, source, output);
@@ -105,27 +106,48 @@ pub(super) fn create_cached_vm(args: &CreateArgs, dirs: &Dirs, output: OutputFor
     }
     fs::create_dir_all(root).map_err(|error| Error::io(root.display(), error))?;
     fs::create_dir(&target_dir).map_err(|error| Error::io(target_dir.display(), error))?;
-    let image = if source.kind == ImageKind::Iso {
-        source.path.clone()
-    } else {
-        let file_name = source
-            .path
-            .file_name()
-            .ok_or_else(|| Error::message("cached image has no file name"))?;
-        let destination = target_dir.join(file_name);
-        fs::copy(&source.path, &destination)
-            .map_err(|error| Error::io(destination.display(), error))?;
-        destination
+    let provision = (|| {
+        let image = if source.kind == ImageKind::Iso {
+            source.path.clone()
+        } else {
+            let file_name = source
+                .path
+                .file_name()
+                .ok_or_else(|| Error::message("cached image has no file name"))?;
+            let destination = target_dir.join(file_name);
+            fs::copy(&source.path, &destination)
+                .map_err(|error| Error::io(destination.display(), error))?;
+            prepare_resolved_image(&source.os, &destination)?
+        };
+        if image_kind(&image.to_string_lossy()) == ImageKind::Disk {
+            crate::qemu::disk_resize(
+                &image,
+                resources
+                    .disk_size
+                    .or_else(|| disk_size(&source.os, source.edition.as_deref()))
+                    .unwrap_or("16G"),
+                false,
+            )?;
+        }
+        let config = write_vm_config(
+            root,
+            name,
+            &source.os,
+            &source.release,
+            source.edition.as_deref(),
+            &source.architecture,
+            &image,
+            resources,
+        )?;
+        Ok((image, config))
+    })();
+    let (image, config) = match provision {
+        Ok(created) => created,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&target_dir);
+            return Err(error);
+        }
     };
-    let config = write_vm_config(
-        root,
-        name,
-        &source.os,
-        &source.release,
-        source.edition.as_deref(),
-        &source.architecture,
-        &image,
-    )?;
     let result = json!({
         "name": name,
         "image": image,
@@ -196,45 +218,60 @@ pub(super) fn download_image(
             )));
         }
     }
-    fs::create_dir_all(&target_dir).map_err(|error| Error::io(target_dir.display(), error))?;
-    let (target, cache) = if create_config {
-        let cache = cache_image(
-            &root,
-            &image,
-            args.insecure,
-            args.refresh_cache,
-            false,
-            None,
-        )?;
-        let target = if image.kind == ImageKind::Iso {
-            cache.path.clone()
+    let target_dir_existed = target_dir.exists();
+    let provision = (|| {
+        fs::create_dir_all(&target_dir).map_err(|error| Error::io(target_dir.display(), error))?;
+        let (target, cache) = if create_config {
+            let cache = cache_image(
+                &root,
+                &image,
+                args.insecure,
+                args.refresh_cache,
+                false,
+                None,
+            )?;
+            let target = if image.kind == ImageKind::Iso {
+                cache.path.clone()
+            } else {
+                let target = target_dir.join(&image.file_name);
+                fs::copy(&cache.path, &target)
+                    .map_err(|error| Error::io(target.display(), error))?;
+                prepare_resolved_image(os, &target)?
+            };
+            (target, Some(cache))
         } else {
             let target = target_dir.join(&image.file_name);
-            fs::copy(&cache.path, &target).map_err(|error| Error::io(target.display(), error))?;
-            prepare_resolved_image(os, &target)?
+            download_file(&image.url, &target, args.insecure)?;
+            if let Err(error) = verify_checksum(&target, image.checksum.as_deref()) {
+                let _ = fs::remove_file(&target);
+                return Err(error);
+            }
+            (target, None)
         };
-        (target, Some(cache))
-    } else {
-        let target = target_dir.join(&image.file_name);
-        download_file(&image.url, &target, args.insecure)?;
-        if let Err(error) = verify_checksum(&target, image.checksum.as_deref()) {
-            let _ = fs::remove_file(&target);
+        let config_path = if create_config {
+            Some(write_vm_config(
+                &root,
+                &name,
+                os,
+                release,
+                image.edition.as_deref(),
+                &architecture,
+                &target,
+                VmResources::default(),
+            )?)
+        } else {
+            None
+        };
+        Ok((target, cache, config_path))
+    })();
+    let (target, cache, config_path) = match provision {
+        Ok(created) => created,
+        Err(error) => {
+            if create_config && !target_dir_existed {
+                let _ = fs::remove_dir_all(&target_dir);
+            }
             return Err(error);
         }
-        (target, None)
-    };
-    let config_path = if create_config {
-        Some(write_vm_config(
-            &root,
-            &name,
-            os,
-            release,
-            image.edition.as_deref(),
-            &architecture,
-            &target,
-        )?)
-    } else {
-        None
     };
     let result = json!({
         "os": os,
@@ -304,59 +341,83 @@ pub(super) fn create_custom_config(
         )));
     }
     fs::create_dir(&vm_dir).map_err(|error| Error::io(vm_dir.display(), error))?;
-    let source_name = input_file_name(input)?;
-    let destination = vm_dir.join(&source_name);
-    let cache = if input.starts_with("http://") || input.starts_with("https://") {
-        Some(cache_url(
-            root,
-            input,
-            &source_name,
-            image_kind(&source_name),
-            None,
-            args.insecure,
-            args.refresh_cache,
-        )?)
-    } else {
-        let source = PathBuf::from(input);
-        if !source.is_file() {
-            return Err(Error::message(format!(
-                "image path does not exist: {}",
-                source.display()
-            )));
-        }
-        if fs::canonicalize(&source).ok() != fs::canonicalize(&destination).ok() {
-            fs::copy(&source, &destination)
-                .map_err(|error| Error::io(destination.display(), error))?;
-        }
-        None
-    };
-    let image = if let Some(cache) = &cache {
-        if image_kind(&source_name) == ImageKind::Iso {
-            cache.path.clone()
+    let mut written_config = None;
+    let provision = (|| {
+        let source_name = input_file_name(input)?;
+        let destination = vm_dir.join(&source_name);
+        let cache = if input.starts_with("http://") || input.starts_with("https://") {
+            Some(cache_url(
+                root,
+                input,
+                &source_name,
+                image_kind(&source_name),
+                None,
+                args.insecure,
+                args.refresh_cache,
+            )?)
         } else {
-            fs::copy(&cache.path, &destination)
-                .map_err(|error| Error::io(destination.display(), error))?;
-            prepare_image(&destination)?
-        }
-    } else {
-        prepare_image(&destination)?
-    };
-    let os = infer_guest_os(&image);
-    let (fixed_iso, unattended_iso) =
-        if matches!(os, "windows" | "windows-server") && !args.disable_unattended {
-            let fixed_iso = download_virtio_iso(&vm_dir, args.insecure)?;
-            let unattended_iso = create_unattended_iso(&vm_dir, args.insecure)?;
-            (Some(fixed_iso), Some(unattended_iso))
-        } else {
-            (None, None)
+            let source = PathBuf::from(input);
+            if !source.is_file() {
+                return Err(Error::message(format!(
+                    "image path does not exist: {}",
+                    source.display()
+                )));
+            }
+            if fs::canonicalize(&source).ok() != fs::canonicalize(&destination).ok() {
+                fs::copy(&source, &destination)
+                    .map_err(|error| Error::io(destination.display(), error))?;
+            }
+            None
         };
-    let config_path = write_vm_config(root, name, os, "custom", None, host_architecture(), &image)?;
-    if let Some(fixed_iso) = fixed_iso.as_deref() {
-        append_iso(root, &config_path, "fixed_iso", fixed_iso)?;
-    }
-    if let Some(unattended_iso) = unattended_iso.as_deref() {
-        append_iso(root, &config_path, "unattended_iso", unattended_iso)?;
-    }
+        let image = if let Some(cache) = &cache {
+            if image_kind(&source_name) == ImageKind::Iso {
+                cache.path.clone()
+            } else {
+                fs::copy(&cache.path, &destination)
+                    .map_err(|error| Error::io(destination.display(), error))?;
+                prepare_image(&destination)?
+            }
+        } else {
+            prepare_image(&destination)?
+        };
+        let os = infer_guest_os(&image);
+        let (fixed_iso, unattended_iso) =
+            if matches!(os, "windows" | "windows-server") && !args.disable_unattended {
+                let fixed_iso = download_virtio_iso(&vm_dir, args.insecure)?;
+                let unattended_iso = create_unattended_iso(&vm_dir, args.insecure)?;
+                (Some(fixed_iso), Some(unattended_iso))
+            } else {
+                (None, None)
+            };
+        let config_path = write_vm_config(
+            root,
+            name,
+            os,
+            "custom",
+            None,
+            host_architecture(),
+            &image,
+            VmResources::default(),
+        )?;
+        written_config = Some(config_path.clone());
+        if let Some(fixed_iso) = fixed_iso.as_deref() {
+            append_iso(root, &config_path, "fixed_iso", fixed_iso)?;
+        }
+        if let Some(unattended_iso) = unattended_iso.as_deref() {
+            append_iso(root, &config_path, "unattended_iso", unattended_iso)?;
+        }
+        Ok((image, os, fixed_iso, unattended_iso, config_path, cache))
+    })();
+    let (image, os, fixed_iso, unattended_iso, config_path, cache) = match provision {
+        Ok(created) => created,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&vm_dir);
+            if let Some(config) = written_config {
+                let _ = fs::remove_file(config);
+            }
+            return Err(error);
+        }
+    };
     let result = json!({
         "name": name,
         "guest_os": os,

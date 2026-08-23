@@ -1,5 +1,7 @@
 use super::*;
 
+pub(super) const NULL_DEVICE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
+
 pub(super) fn fetch_text(url: &str) -> Result<String> {
     let output = Command::new("curl")
         .args([
@@ -51,40 +53,99 @@ pub(super) fn requested_architectures(args: &GetArgs, os: &str) -> Result<Vec<St
 }
 
 pub(super) fn download_file(url: &str, destination: &Path, insecure: bool) -> Result<()> {
-    if fs::symlink_metadata(destination)
-        .ok()
-        .is_some_and(|metadata| metadata.file_type().is_symlink())
-    {
-        return Err(Error::message(format!(
-            "refusing to download through symlink {}",
-            destination.display()
-        )));
-    }
+    download_file_with_headers(url, destination, &[], insecure)
+}
+
+pub(super) fn download_file_with_headers(
+    url: &str,
+    destination: &Path,
+    headers: &[String],
+    insecure: bool,
+) -> Result<()> {
     let parent = destination
         .parent()
         .ok_or_else(|| Error::message("download destination has no parent directory"))?;
     fs::create_dir_all(parent).map_err(|error| Error::io(parent.display(), error))?;
+    let (temporary, file) = stage_new_file(destination)?;
+    let output = match file.try_clone() {
+        Ok(file) => file,
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            return Err(Error::io(temporary.display(), error));
+        }
+    };
     let mut command = Command::new("curl");
-    command.args([
-        "--disable",
-        "--fail",
-        "--location",
-        "--continue-at",
-        "-",
-        "--output",
-    ]);
+    command.args(["--disable", "--fail", "--location"]);
     command.args(curl_security_args(insecure));
+    for header in headers {
+        command.args(["--header", header]);
+    }
     let status = command
-        .arg(destination)
         .arg("--")
         .arg(url)
+        .stdout(Stdio::from(output))
         .status()
-        .map_err(|error| Error::command_unavailable("curl", error))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(Error::command_failed_status("curl", status))
+        .map_err(|error| Error::command_unavailable("curl", error));
+    let downloaded = match status {
+        Ok(status) if status.success() => file
+            .sync_all()
+            .map_err(|error| Error::io(temporary.display(), error)),
+        Ok(status) => Err(Error::command_failed_status("curl", status)),
+        Err(error) => Err(error),
+    };
+    drop(file);
+    let result = downloaded.and_then(|()| commit_new_file(&temporary, destination));
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
     }
+    result
+}
+
+pub(super) fn ensure_new_file(destination: &Path) -> Result<()> {
+    match fs::symlink_metadata(destination) {
+        Ok(_) => Err(Error::message(format!(
+            "download destination already exists: {}",
+            destination.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(Error::io(destination.display(), error)),
+    }
+}
+
+pub(super) fn stage_new_file(destination: &Path) -> Result<(PathBuf, fs::File)> {
+    ensure_new_file(destination)?;
+    let file_name = destination
+        .file_name()
+        .ok_or_else(|| Error::message("download destination has no file name"))?
+        .to_string_lossy();
+    for attempt in 0..100u32 {
+        let temporary = destination.with_file_name(format!(
+            ".{file_name}.vmctl-{}-{attempt}.tmp",
+            std::process::id()
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => return Ok((temporary, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(Error::io(temporary.display(), error)),
+        }
+    }
+    Err(Error::message(format!(
+        "could not create a private download file beside {}",
+        destination.display()
+    )))
+}
+
+pub(super) fn commit_new_file(temporary: &Path, destination: &Path) -> Result<()> {
+    if let Err(error) = fs::hard_link(temporary, destination) {
+        let _ = fs::remove_file(temporary);
+        return Err(Error::io(destination.display(), error));
+    }
+    let _ = fs::remove_file(temporary);
+    Ok(())
 }
 
 pub(super) fn verify_checksum(path: &Path, expected: Option<&str>) -> Result<()> {

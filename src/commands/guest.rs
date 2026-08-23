@@ -52,6 +52,10 @@ pub(super) fn guest_vm(
                 &vm.config.name,
                 deadline.saturating_duration_since(std::time::Instant::now()),
             ) {
+                let _ = fs::remove_file(vm.paths.pid_file());
+                stop_tpm(&vm.paths);
+                stop_virtiofsd(&vm.paths);
+                remove_runtime_sockets(&vm.paths);
                 (
                     "guest-shutdown",
                     json!({"requested": true, "stopped": true, "pid": pid}),

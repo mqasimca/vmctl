@@ -23,8 +23,7 @@ pub(super) fn ssh_vm(dirs: &Dirs, name: &str, user: Option<&str>) -> Result<()> 
             vm.config.name
         )));
     }
-    let port = active_ssh_port(&vm)?;
-    let host = ssh_connect_host(&vm.config);
+    let (host, port) = active_ssh_endpoint(&vm)?;
     let mut command = ProcessCommand::new("ssh");
     command
         .args(vm_ssh_options())
@@ -34,7 +33,7 @@ pub(super) fn ssh_vm(dirs: &Dirs, name: &str, user: Option<&str>) -> Result<()> 
         command.arg("-l").arg(user);
     }
     let status = command
-        .arg(host)
+        .arg(&host)
         .status()
         .map_err(|error| Error::command_unavailable("ssh", error))?;
     if status.success() {
@@ -50,14 +49,20 @@ pub(super) fn view_vm(
     viewer: Option<&str>,
     output: OutputFormat,
 ) -> Result<()> {
-    let vm = find(&dirs.vm_dir, &dirs.state_root, name)?;
+    let mut vm = find(&dirs.vm_dir, &dirs.state_root, name)?;
     if !matches!(vm.state()?, VmState::Running(_)) {
         return Err(Error::message(format!(
             "{} is not running; start it before opening its display",
             vm.config.name
         )));
     }
-    let port = runtime_port(&vm.paths.state_dir.join("ports"), "spice");
+    let (_, listener) = runtime_listener(&vm.paths.state_dir.join("ports"), "spice")?;
+    let port = listener.map(|(port, host)| {
+        if let Some(host) = host {
+            vm.config.access = connect_host(&host).to_string();
+        }
+        port
+    });
     if port.is_none() && !vm.paths.spice_socket().exists() {
         return Err(Error::message(format!(
             "{} has no active SPICE display; restart it with --display none, --display spice, or --display spice-app",
@@ -75,7 +80,7 @@ pub(super) fn view_vm(
     start_viewer(&vm, viewer, port)?;
     let endpoint = port.map_or_else(
         || format!("spice+unix://{}", vm.paths.spice_socket().display()),
-        |port| format!("spice://{}:{port}", spice_address(&vm.config)),
+        |port| spice_tcp_uri(connect_host(spice_address(&vm.config)), port),
     );
     if output == OutputFormat::Json {
         print_json_success(
@@ -87,9 +92,23 @@ pub(super) fn view_vm(
     Ok(())
 }
 
-pub(super) fn active_ssh_port(vm: &Vm) -> Result<u16> {
-    runtime_port(&vm.paths.state_dir.join("ports"), "ssh")
-        .or(vm.config.ssh_port)
+pub(super) fn active_ssh_endpoint(vm: &Vm) -> Result<(String, u16)> {
+    let (saved, listener) = runtime_listener(&vm.paths.state_dir.join("ports"), "ssh")?;
+    let listener = if saved {
+        listener
+    } else {
+        vm.config.ssh_port.map(|port| (port, None))
+    };
+    listener
+        .map(|(port, host)| {
+            (
+                host.as_deref()
+                    .map(connect_host)
+                    .unwrap_or_else(|| ssh_connect_host(&vm.config))
+                    .to_string(),
+                port,
+            )
+        })
         .ok_or_else(|| {
             Error::message(format!(
                 "{} has no active SSH forward; use network=user or network=passt and restart it",
@@ -99,15 +118,11 @@ pub(super) fn active_ssh_port(vm: &Vm) -> Result<u16> {
 }
 
 pub(super) fn ssh_connect_host(config: &VmConfig) -> &str {
-    match config.ssh_access.as_str() {
-        "" | "local" | "remote" => "127.0.0.1",
-        host => host,
-    }
+    connect_host(&config.ssh_access)
 }
 
 pub(super) fn wait_for_ssh_ready(vm: &Vm, timeout: Duration, output: OutputFormat) -> Result<()> {
-    let port = active_ssh_port(vm)?;
-    let host = ssh_connect_host(&vm.config);
+    let (host, port) = active_ssh_endpoint(vm)?;
     let endpoint = if host.parse::<std::net::Ipv6Addr>().is_ok() {
         format!("[{host}]:{port}")
     } else {
@@ -193,30 +208,21 @@ pub(super) fn start_vm_loaded(
         return Ok(());
     }
 
-    check_tsc_stability(vm, output == OutputFormat::Json)?;
-    validate_usb_devices(vm)?;
-
     fs::create_dir_all(&vm.paths.state_dir)
         .map_err(|error| Error::io(vm.paths.state_dir.display(), error))?;
     remove_runtime_sockets(&vm.paths);
     stop_tpm(&vm.paths);
     stop_virtiofsd(&vm.paths);
     let _ = fs::remove_file(vm.paths.pid_file());
+    let mut host = preflight_vm(vm, output == OutputFormat::Json)?;
     ensure_disk(vm)?;
 
     let log_path = vm.paths.state_dir.join("qemu.log");
-    let log = File::create(&log_path).map_err(|error| Error::io(log_path.display(), error))?;
+    let log = qemu::create_truncated_file(&log_path)
+        .map_err(|error| Error::io(log_path.display(), error))?;
     let error_log = log
         .try_clone()
         .map_err(|error| Error::io(log_path.display(), error))?;
-    let mut host = HostCapabilities::detect(&vm.config)?;
-    if let Some(pinning) = &vm.config.cpu_pinning {
-        validate_cpu_pinning_for_host(
-            pinning,
-            &host.host_os,
-            vm.config.cpu_cores.unwrap_or(host.cpu_cores),
-        )?;
-    }
     let mut plan = build_plan(vm, &host, true)?;
     write_runtime_files(&vm.paths, &plan)?;
     if virtiofs_requested(&vm.config, &host)
@@ -369,6 +375,21 @@ pub(super) fn start_vm_loaded(
         }
     }
     Ok(())
+}
+
+pub(super) fn preflight_vm(vm: &Vm, quiet: bool) -> Result<HostCapabilities> {
+    check_tsc_stability(vm, quiet)?;
+    validate_usb_devices(vm)?;
+    let host = HostCapabilities::detect(&vm.config)?;
+    if let Some(pinning) = &vm.config.cpu_pinning {
+        validate_cpu_pinning_for_host(
+            pinning,
+            &host.host_os,
+            vm.config.cpu_cores.unwrap_or(host.cpu_cores),
+        )?;
+    }
+    build_plan(vm, &host, false)?;
+    Ok(host)
 }
 
 pub(super) fn stop_vm(

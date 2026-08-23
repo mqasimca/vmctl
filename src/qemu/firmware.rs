@@ -45,32 +45,53 @@ pub(super) fn firmware_data_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-pub(super) fn firmware_pair_candidates(pairs: &[(&str, &str)]) -> Vec<(PathBuf, PathBuf)> {
+pub(super) fn firmware_pair_candidates(
+    pairs: &[(&str, &str)],
+    arch: &str,
+    secureboot: bool,
+) -> Vec<(PathBuf, PathBuf)> {
     let mut candidates = pairs
         .iter()
         .map(|(code, vars)| (PathBuf::from(code), PathBuf::from(vars)))
         .collect::<Vec<_>>();
+    let relative_pairs = relative_firmware_pairs(arch, secureboot);
     for dir in firmware_data_dirs() {
-        candidates.extend([
-            (
-                dir.join("edk2-x86_64-code.fd"),
-                dir.join("edk2-i386-vars.fd"),
-            ),
-            (
-                dir.join("edk2-x86_64-secure-code.fd"),
-                dir.join("edk2-i386-vars.fd"),
-            ),
-            (
-                dir.join("edk2-aarch64-code.fd"),
-                dir.join("edk2-arm-vars.fd"),
-            ),
-            (
-                dir.join("edk2").join("x64").join("OVMF_CODE.4m.fd"),
-                dir.join("edk2").join("x64").join("OVMF_VARS.4m.fd"),
-            ),
-        ]);
+        candidates.extend(
+            relative_pairs
+                .iter()
+                .map(|(code, vars)| (dir.join(code), dir.join(vars))),
+        );
     }
     candidates
+}
+
+pub(super) fn relative_firmware_pairs(
+    arch: &str,
+    secureboot: bool,
+) -> &'static [(&'static str, &'static str)] {
+    if arch == "aarch64" {
+        &[
+            ("edk2-aarch64-code.fd", "edk2-arm-vars.fd"),
+            ("edk2-arm-code.fd", "edk2-arm-vars.fd"),
+        ]
+    } else if secureboot {
+        &[("edk2-x86_64-secure-code.fd", "edk2-i386-vars.fd")]
+    } else {
+        &[
+            ("edk2-x86_64-code.fd", "edk2-i386-vars.fd"),
+            ("edk2/x64/OVMF_CODE.4m.fd", "edk2/x64/OVMF_VARS.4m.fd"),
+        ]
+    }
+}
+
+fn reject_unsafe_firmware_vars(path: &Path) -> Result<()> {
+    if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(Error::message(format!(
+            "refusing to use UEFI variables symlink {}",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 pub(super) fn firmware_paths(vm: &Vm, prepare: bool) -> Result<(PathBuf, PathBuf)> {
@@ -112,9 +133,11 @@ pub(super) fn firmware_paths(vm: &Vm, prepare: bool) -> Result<(PathBuf, PathBuf
         .into_iter()
         .find(|path| path.is_file())
         {
+            reject_unsafe_firmware_vars(&vars)?;
             return Ok((code, vars));
         }
         let vars = parent.join("OVMF_VARS.fd");
+        reject_unsafe_firmware_vars(&vars)?;
         if prepare {
             let template = first_existing(&[
                 "/usr/share/edk2/x64/OVMF_VARS.4m.fd",
@@ -158,6 +181,10 @@ pub(super) fn firmware_paths(vm: &Vm, prepare: bool) -> Result<(PathBuf, PathBuf
             ),
             (
                 "/usr/share/edk2/aarch64/QEMU_CODE.fd",
+                "/usr/share/edk2/aarch64/QEMU_VARS.fd",
+            ),
+            (
+                "/usr/share/edk2/aarch64/QEMU_EFI.fd",
                 "/usr/share/edk2/aarch64/QEMU_VARS.fd",
             ),
             (
@@ -216,7 +243,8 @@ pub(super) fn firmware_paths(vm: &Vm, prepare: bool) -> Result<(PathBuf, PathBuf
             ),
         ]
     };
-    let firmware_pairs = firmware_pair_candidates(&static_pairs);
+    let firmware_pairs =
+        firmware_pair_candidates(&static_pairs, &vm.config.arch, vm.config.secureboot);
     let (code, template) = firmware_pairs
         .into_iter()
         .find(|(code, vars)| code.is_file() && vars.is_file())
@@ -229,6 +257,7 @@ pub(super) fn firmware_paths(vm: &Vm, prepare: bool) -> Result<(PathBuf, PathBuf
     .into_iter()
     .find(|path| path.is_file())
     .unwrap_or_else(|| parent.join("OVMF_VARS.fd"));
+    reject_unsafe_firmware_vars(&vars)?;
     if prepare && !vars.is_file() {
         fs::create_dir_all(parent).map_err(|error| Error::io(parent.display(), error))?;
         fs::copy(&template, &vars).map_err(|error| {

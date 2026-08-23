@@ -1,7 +1,9 @@
 use super::*;
 
 pub fn build_plan(vm: &Vm, host: &QemuPlanContext, prepare_firmware: bool) -> Result<QemuPlan> {
+    validate_windows_tpm_listener(vm, host)?;
     let (qmp_endpoint, agent_endpoint) = ipc_endpoints(vm, host)?;
+    validate_unix_socket_paths(vm, host, &qmp_endpoint, agent_endpoint.as_ref())?;
     let machine = machine_type(&vm.config);
     let tcg_accel = if host.accelerator == "tcg" {
         let ram_gib = host
@@ -175,6 +177,7 @@ pub fn build_plan(vm: &Vm, host: &QemuPlanContext, prepare_firmware: bool) -> Re
         }
     }
 
+    add_boot_args(&mut args, &vm.config);
     add_storage_args(&mut args, vm)?;
 
     add_guest_tweaks(&mut args, &vm.config, machine);
@@ -403,15 +406,19 @@ pub fn build_plan(vm: &Vm, host: &QemuPlanContext, prepare_firmware: bool) -> Re
             "-monitor",
             control_endpoint(&vm.paths.monitor_socket(), &host.host_os),
         ),
-        "telnet" => add(
-            &mut args,
-            "-monitor",
-            format!(
-                "telnet:{}:{},server=on,wait=off",
-                qemu_host(&vm.config.monitor_telnet_host),
-                vm.config.monitor_telnet_port
-            ),
-        ),
+        "telnet" => {
+            add_telnet_chardev(
+                &mut args,
+                "monitor0",
+                &vm.config.monitor_telnet_host,
+                vm.config.monitor_telnet_port,
+            );
+            add(
+                &mut args,
+                "-mon",
+                "chardev=monitor0,mode=readline".to_string(),
+            );
+        }
         monitor => {
             return Err(Error::message(format!(
                 "monitor mode '{monitor}' is unsupported"
@@ -426,15 +433,15 @@ pub fn build_plan(vm: &Vm, host: &QemuPlanContext, prepare_firmware: bool) -> Re
             "-serial",
             control_endpoint(&vm.paths.serial_socket(), &host.host_os),
         ),
-        "telnet" => add(
-            &mut args,
-            "-serial",
-            format!(
-                "telnet:{}:{},server=on,wait=off",
-                qemu_host(&vm.config.serial_telnet_host),
-                vm.config.serial_telnet_port
-            ),
-        ),
+        "telnet" => {
+            add_telnet_chardev(
+                &mut args,
+                "serial0",
+                &vm.config.serial_telnet_host,
+                vm.config.serial_telnet_port,
+            );
+            add(&mut args, "-serial", "chardev:serial0".to_string());
+        }
         serial => {
             return Err(Error::message(format!(
                 "serial mode '{serial}' is unsupported"
@@ -468,7 +475,109 @@ pub fn build_plan(vm: &Vm, host: &QemuPlanContext, prepare_firmware: bool) -> Re
                 vm.config.serial_telnet_port,
             )
         }),
+        forwarded_ports: if uses_port_forwarding_network(&vm.config) {
+            vm.config
+                .port_forwards
+                .iter()
+                .map(|(host, _)| ("127.0.0.1".to_string(), *host))
+                .collect()
+        } else {
+            Vec::new()
+        },
     })
+}
+
+#[cfg(unix)]
+fn validate_unix_socket_paths(
+    vm: &Vm,
+    host: &QemuPlanContext,
+    qmp: &IpcEndpoint,
+    agent: Option<&IpcEndpoint>,
+) -> Result<()> {
+    if host.host_os == "windows" {
+        return Ok(());
+    }
+    let mut paths = Vec::new();
+    if let IpcEndpoint::Unix(path) = qmp {
+        paths.push(path.clone());
+    }
+    if let Some(IpcEndpoint::Unix(path)) = agent {
+        paths.push(path.clone());
+    }
+    if vm.config.monitor == "socket" {
+        paths.push(vm.paths.monitor_socket());
+    }
+    if vm.config.serial == "socket" {
+        paths.push(vm.paths.serial_socket());
+    }
+    if matches!(vm.config.display.as_str(), "spice" | "spice-app") && host.spice_port.is_none() {
+        paths.push(vm.paths.spice_socket());
+    }
+    if vm.config.tpm {
+        paths.push(vm.paths.tpm_socket());
+    }
+    if virtiofs_requested(&vm.config, host) {
+        paths.push(vm.paths.virtiofs_socket());
+    }
+    for path in paths {
+        std::os::unix::net::SocketAddr::from_pathname(&path).map_err(|error| {
+            Error::message(format!(
+                "runtime socket path {} is unsupported: {error}; use a shorter --state-dir or VM name",
+                path.display()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_unix_socket_paths(
+    _vm: &Vm,
+    _host: &QemuPlanContext,
+    _qmp: &IpcEndpoint,
+    _agent: Option<&IpcEndpoint>,
+) -> Result<()> {
+    Ok(())
+}
+
+pub(super) fn add_telnet_chardev(args: &mut Vec<String>, id: &str, host: &str, port: u16) {
+    add(
+        args,
+        "-chardev",
+        format!("socket,id={id},host={host},port={port},server=on,wait=off,telnet=on"),
+    );
+}
+
+pub(super) fn validate_windows_tpm_listener(vm: &Vm, host: &QemuPlanContext) -> Result<()> {
+    if host.host_os != "windows" || !vm.config.tpm {
+        return Ok(());
+    }
+    let port = control_port(&vm.paths.tpm_socket());
+    let conflict = if host.ssh_port == Some(port) {
+        Some("SSH")
+    } else if host.spice_port == Some(port) {
+        Some("SPICE")
+    } else if vm.config.monitor == "telnet" && vm.config.monitor_telnet_port == port {
+        Some("monitor Telnet")
+    } else if vm.config.serial == "telnet" && vm.config.serial_telnet_port == port {
+        Some("serial Telnet")
+    } else if uses_port_forwarding_network(&vm.config)
+        && vm
+            .config
+            .port_forwards
+            .iter()
+            .any(|(host, _)| *host == port)
+    {
+        Some("a forwarded port")
+    } else {
+        None
+    };
+    if let Some(service) = conflict {
+        return Err(Error::message(format!(
+            "TPM control port {port} conflicts with {service}; choose another configured port"
+        )));
+    }
+    Ok(())
 }
 
 pub(super) fn ipc_endpoints(
@@ -697,5 +806,32 @@ pub(super) fn cpu_model(config: &VmConfig, host: &QemuPlanContext) -> String {
         }
         _ if host.accelerator == "kvm" || host.accelerator == "hvf" => "host".to_string(),
         _ => "qemu64".to_string(),
+    }
+}
+
+fn add_boot_args(args: &mut Vec<String>, config: &VmConfig) {
+    let order = match config.guest_os.as_str() {
+        "freedos" if config.iso.is_some() => Some("dc"),
+        "kolibrios" if config.iso.is_some() => Some("d"),
+        _ => None,
+    };
+    let once = config.boot_once.as_deref().map(|device| match device {
+        "disk" => "c",
+        "cdrom" => "d",
+        "network" => "n",
+        _ => unreachable!("VmConfig::validate checked boot_once"),
+    });
+    let mut options = Vec::new();
+    if let Some(order) = order {
+        options.push(format!("order={order}"));
+    }
+    if let Some(once) = once {
+        options.push(format!("once={once}"));
+    }
+    if config.boot_menu {
+        options.push("menu=on".to_string());
+    }
+    if !options.is_empty() {
+        add(args, "-boot", options.join(","));
     }
 }

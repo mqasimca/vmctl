@@ -59,6 +59,15 @@ tpm="off"
 }
 
 #[test]
+fn validates_positive_qemu_ram_sizes() {
+    assert!(validate_ram_size("8G").is_ok());
+    assert!(validate_ram_size("512M").is_ok());
+    assert!(validate_ram_size("0").is_err());
+    assert!(validate_ram_size("8Z").is_err());
+    assert!(validate_ram_size("8 G").is_err());
+}
+
+#[test]
 fn tokenizes_quoted_values_and_escapes() {
     assert_eq!(
         parse_tokens(Some(&"-device 'virtio-rng-pci'".to_string())),
@@ -114,6 +123,71 @@ fn rejects_invalid_ports_and_modes() {
 }
 
 #[test]
+fn rejects_duplicate_forwarded_host_ports() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("duplicate-forwards.conf");
+    fs::write(&path, "port_forwards=(\"8080:80\" \"8080:443\")\n").unwrap();
+    let error = load_vm(root.path(), root.path(), path).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("port_forwards repeats host port 8080")
+    );
+}
+
+#[test]
+fn rejects_invalid_boot_and_disk_settings() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("broken-options.conf");
+    fs::write(&path, "boot_once=floppy\ndisk_cache=unsafe\n").unwrap();
+    let error = load_vm(root.path(), root.path(), path).unwrap_err();
+    assert!(error.to_string().contains("boot_once must be one of"));
+}
+
+#[test]
+fn rejects_raw_metadata_preallocation() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("raw.conf");
+    fs::write(&path, "disk_format=raw\npreallocation=metadata\n").unwrap();
+    let error = load_vm(root.path(), root.path(), path).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("preallocation=metadata is unsupported for raw disks")
+    );
+}
+
+#[test]
+fn rejects_whitespace_in_vm_names() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("unsafe name.conf");
+    fs::write(&path, "boot=legacy\n").unwrap();
+    let error = load_vm(root.path(), root.path(), path).unwrap_err();
+    assert!(error.to_string().contains("unsafe for QEMU process naming"));
+}
+
+#[test]
+fn native_aio_requires_direct_disk_cache() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("native-aio.conf");
+    fs::write(&path, "disk_aio=native\n").unwrap();
+    let error = load_vm(root.path(), root.path(), path).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("disk_aio=native requires disk_cache=none or directsync")
+    );
+
+    let path = root.path().join("native-aio-none.conf");
+    fs::write(&path, "disk_aio=native\ndisk_cache=none\n").unwrap();
+    assert!(load_vm(root.path(), root.path(), path).is_ok());
+
+    let path = root.path().join("native-aio-directsync.conf");
+    fs::write(&path, "disk_aio=native\ndisk_cache=directsync\n").unwrap();
+    assert!(load_vm(root.path(), root.path(), path).is_ok());
+}
+
+#[test]
 fn rejects_clipboard_without_gtk() {
     let root = tempdir().unwrap();
     let path = root.path().join("clipboard.conf");
@@ -156,6 +230,69 @@ fn rejects_disk_and_extra_argument_injection() {
     fs::write(&args_path, "extra_args=(\"-qmp\" \"tcp:0.0.0.0:4444\")\n").unwrap();
     let error = load_vm(root.path(), root.path(), args_path).unwrap_err();
     assert!(error.to_string().contains("extra_args contains '-qmp'"));
+
+    let args_path = root.path().join("unsafe-long-args.conf");
+    fs::write(&args_path, "extra_args=(\"--qmp=tcp:0.0.0.0:4444\")\n").unwrap();
+    let error = load_vm(root.path(), root.path(), args_path).unwrap_err();
+    assert!(error.to_string().contains("extra_args contains '--qmp="));
+}
+
+#[test]
+fn rejects_qemu_control_overrides_and_positional_disks() {
+    for argument in [
+        "/tmp/extra.raw",
+        "--readconfig=/tmp/qemu.conf",
+        "-plugin=/tmp/plugin.so",
+        "-incoming=exec:helper",
+        "-run-with=chroot=/tmp",
+        "-semihosting",
+        "-semihosting-config=enable=on,target=native",
+        "-hda=/tmp/extra.raw",
+        "-net=user,hostfwd=tcp:0.0.0.0:45555-:22",
+        "-vnc=0.0.0.0:0",
+        "-machine=none",
+        "-no-shutdown",
+        "-qtest",
+        "-qtest-log",
+        "-add-fd",
+        "-perfmap",
+        "-jitdump",
+        "-icount",
+        "-chroot",
+        "-runas",
+        "-user",
+    ] {
+        assert!(
+            unsafe_extra_argument(&[argument.to_string()]).is_some(),
+            "accepted {argument}"
+        );
+    }
+
+    let safe = ["-msg", "timestamp=on"]
+        .map(str::to_string)
+        .into_iter()
+        .collect::<Vec<_>>();
+    assert_eq!(unsafe_extra_argument(&safe), None);
+
+    let positional = ["-msg", "timestamp=on", "/tmp/extra.raw"]
+        .map(str::to_string)
+        .into_iter()
+        .collect::<Vec<_>>();
+    assert_eq!(unsafe_extra_argument(&positional), Some("/tmp/extra.raw"));
+
+    let missing_value = vec!["-msg".to_string()];
+    assert_eq!(unsafe_extra_argument(&missing_value), Some("-msg"));
+
+    let root = tempdir().unwrap();
+    let path = root.path().join("safe-extra-args.conf");
+    fs::write(&path, "extra_args=(\"-msg\" \"timestamp=on\")\n").unwrap();
+    assert_eq!(
+        load_vm(root.path(), root.path(), path)
+            .unwrap()
+            .config
+            .extra_args,
+        ["-msg", "timestamp=on"]
+    );
 }
 
 #[test]

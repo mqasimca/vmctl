@@ -1,27 +1,28 @@
 use super::*;
 
 pub fn write_runtime_files(paths: &VmPaths, plan: &QemuPlan) -> Result<()> {
-    fs::create_dir_all(&paths.state_dir)
-        .map_err(|error| Error::io(paths.state_dir.display(), error))?;
-    #[cfg(unix)]
-    fs::set_permissions(&paths.state_dir, fs::Permissions::from_mode(0o700))
-        .map_err(|error| Error::io(paths.state_dir.display(), error))?;
+    ensure_state_directory(&paths.state_dir)?;
     let command_path = paths.state_dir.join("qemu.command");
-    fs::write(
+    write_atomic_file(
         &command_path,
-        format!("{}\n", shell_join(&plan.binary, &plan.args)),
-    )
-    .map_err(|error| Error::io(command_path.display(), error))?;
+        format!("{}\n", shell_join(&plan.binary, &plan.args)).as_bytes(),
+    )?;
 
     let mut ports = String::new();
     if let Some(port) = plan.ssh_port {
-        ports.push_str(&format!("ssh,{port}\n"));
+        ports.push_str(&format!(
+            "ssh,{port},{}\n",
+            plan.ssh_host.as_deref().unwrap_or("127.0.0.1")
+        ));
     }
     if let Some(port) = plan.spice_port {
-        ports.push_str(&format!("spice,{port}\n"));
+        ports.push_str(&format!(
+            "spice,{port},{}\n",
+            plan.spice_host.as_deref().unwrap_or("127.0.0.1")
+        ));
     }
     let ports_path = paths.state_dir.join("ports");
-    fs::write(&ports_path, ports).map_err(|error| Error::io(ports_path.display(), error))?;
+    write_atomic_file(&ports_path, ports.as_bytes())?;
 
     let ipc_path = paths.ipc_state();
     let ipc = json!({
@@ -29,23 +30,60 @@ pub fn write_runtime_files(paths: &VmPaths, plan: &QemuPlan) -> Result<()> {
         "qmp": plan.qmp_endpoint.json_value(),
         "guest_agent": plan.agent_endpoint.as_ref().map(IpcEndpoint::json_value),
     });
-    write_runtime_file(&ipc_path, format!("{ipc}\n").as_bytes())?;
+    write_atomic_file(&ipc_path, format!("{ipc}\n").as_bytes())?;
     Ok(())
 }
 
-pub(super) fn write_runtime_file(path: &Path, contents: &[u8]) -> Result<()> {
-    let temporary = path.with_extension("tmp");
-    fs::write(&temporary, contents).map_err(|error| Error::io(temporary.display(), error))?;
-    replace_runtime_file(&temporary, path)
+pub(crate) fn write_atomic_file(path: &Path, contents: &[u8]) -> Result<()> {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
+    let mut temporary = None;
+    for _ in 0..8 {
+        let candidate = path.with_file_name(format!(
+            ".{file_name}.vmctl-{}-{}.tmp",
+            std::process::id(),
+            next_guest_sync_id().unsigned_abs()
+        ));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                temporary = Some((candidate, file));
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(Error::io(candidate.display(), error)),
+        }
+    }
+    let (temporary, mut file) = temporary.ok_or_else(|| {
+        Error::message(format!(
+            "cannot allocate a temporary runtime file beside {}",
+            path.display()
+        ))
+    })?;
+    if let Err(error) = file.write_all(contents).and_then(|()| file.sync_all()) {
+        let _ = fs::remove_file(&temporary);
+        return Err(Error::io(temporary.display(), error));
+    }
+    drop(file);
+    if let Err(error) = replace_file(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
 }
 
 #[cfg(not(windows))]
-pub(super) fn replace_runtime_file(temporary: &Path, destination: &Path) -> Result<()> {
+pub(crate) fn replace_file(temporary: &Path, destination: &Path) -> Result<()> {
     fs::rename(temporary, destination).map_err(|error| Error::io(destination.display(), error))
 }
 
 #[cfg(windows)]
-pub(super) fn replace_runtime_file(temporary: &Path, destination: &Path) -> Result<()> {
+pub(crate) fn replace_file(temporary: &Path, destination: &Path) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
@@ -176,7 +214,55 @@ pub(crate) fn qmp_status(paths: &VmPaths) -> Result<String> {
     .ok_or_else(|| Error::Qmp("query-status returned no status".to_string()))
 }
 
-pub(crate) fn ipc_report(paths: &VmPaths) -> Result<Value> {
+pub(crate) fn qmp_live_resources(paths: &VmPaths) -> Result<Value> {
+    let endpoint = qmp_endpoint_for_paths(paths)?;
+    let deadline = qmp_deadline()?;
+    let mut stream = connect_endpoint_retry(&endpoint, "QMP")?;
+    stream
+        .set_read_timeout(Some(QMP_TIMEOUT))
+        .map_err(|error| Error::io(endpoint.display(), error))?;
+    let mut reader = BufReader::new(
+        stream
+            .try_clone()
+            .map_err(|error| Error::io(endpoint.display(), error))?,
+    );
+    read_qmp_greeting_until(&mut reader, deadline)?;
+    execute_qmp(
+        &mut stream,
+        &mut reader,
+        "qmp_capabilities",
+        "vmctl-live-capabilities",
+        None,
+        deadline,
+    )?;
+    let cpus = execute_qmp(
+        &mut stream,
+        &mut reader,
+        "query-cpus-fast",
+        "vmctl-live-cpus",
+        None,
+        deadline,
+    )?;
+    let memory = execute_qmp(
+        &mut stream,
+        &mut reader,
+        "query-memory-size-summary",
+        "vmctl-live-memory",
+        None,
+        deadline,
+    )?;
+    let block = execute_qmp(
+        &mut stream,
+        &mut reader,
+        "query-block",
+        "vmctl-live-block",
+        None,
+        deadline,
+    )?;
+    Ok(json!({"cpus": cpus, "memory": memory, "block": block}))
+}
+
+pub(crate) fn ipc_report(paths: &VmPaths, _guest_agent: bool) -> Result<Value> {
     if paths.ipc_state().is_file() {
         let (qmp, agent) = read_ipc_state(paths)?;
         return Ok(json!({
@@ -189,7 +275,7 @@ pub(crate) fn ipc_report(paths: &VmPaths) -> Result<Value> {
     {
         Ok(json!({
             "qmp": IpcEndpoint::Unix(paths.qmp_socket()).json_value(),
-            "guest_agent": IpcEndpoint::Unix(paths.agent_socket()).json_value(),
+            "guest_agent": _guest_agent.then(|| IpcEndpoint::Unix(paths.agent_socket()).json_value()),
         }))
     }
     #[cfg(not(unix))]
@@ -216,8 +302,12 @@ pub(crate) fn ensure_ipc_endpoints_available(plan: &QemuPlan) -> Result<()> {
     if let Some((host, port)) = &plan.serial_telnet {
         tcp_endpoints.push(("serial Telnet", host.clone(), *port));
     }
+    for (host, port) in &plan.forwarded_ports {
+        tcp_endpoints.push(("forwarded TCP", host.clone(), *port));
+    }
 
     let mut seen = Vec::new();
+    let mut listeners = Vec::new();
     for (name, host, port) in tcp_endpoints {
         let key = format!("{host}:{port}");
         if seen.iter().any(|seen_key| seen_key == &key) {
@@ -225,12 +315,23 @@ pub(crate) fn ensure_ipc_endpoints_available(plan: &QemuPlan) -> Result<()> {
                 "{name} endpoint {key} conflicts with another configured listener; choose unique ports"
             )));
         }
-        TcpListener::bind((host.as_str(), port)).map_err(|error| {
+        let listener = TcpListener::bind((host.as_str(), port)).map_err(|error| {
             Error::message(format!(
                 "{name} endpoint {key} is unavailable: {error}; choose another port or stop the conflicting service"
             ))
         })?;
+        listeners.push(listener);
         seen.push(key);
+    }
+    let mut udp_sockets = Vec::new();
+    for (host, port) in &plan.forwarded_ports {
+        let key = format!("{host}:{port}");
+        let socket = UdpSocket::bind((host.as_str(), *port)).map_err(|error| {
+            Error::message(format!(
+                "forwarded UDP endpoint {key} is unavailable: {error}; choose another port or stop the conflicting service"
+            ))
+        })?;
+        udp_sockets.push(socket);
     }
     Ok(())
 }
@@ -370,10 +471,10 @@ pub(crate) fn start_tpm(vm: &Vm) -> Result<Option<Child>> {
     if !vm.config.tpm {
         return Ok(None);
     }
-    fs::create_dir_all(&vm.paths.state_dir)
-        .map_err(|error| Error::io(vm.paths.state_dir.display(), error))?;
+    ensure_state_directory(&vm.paths.state_dir)?;
     let log_path = vm.paths.state_dir.join("swtpm.log");
-    let log = File::create(&log_path).map_err(|error| Error::io(log_path.display(), error))?;
+    let log =
+        create_truncated_file(&log_path).map_err(|error| Error::io(log_path.display(), error))?;
     let error_log = log
         .try_clone()
         .map_err(|error| Error::io(log_path.display(), error))?;
@@ -407,10 +508,13 @@ pub(crate) fn start_tpm(vm: &Vm) -> Result<Option<Child>> {
         .stderr(Stdio::from(error_log))
         .spawn()
         .map_err(|error| Error::command_unavailable("swtpm", error))?;
-    if let Err(error) = fs::write(vm.paths.tpm_pid_file(), process_record(child.id() as i32)) {
+    if let Err(error) = write_atomic_file(
+        &vm.paths.tpm_pid_file(),
+        process_record(child.id() as i32).as_bytes(),
+    ) {
         let _ = child.kill();
         let _ = child.wait();
-        return Err(Error::io(vm.paths.tpm_pid_file().display(), error));
+        return Err(error);
     }
     for _ in 0..20 {
         let ready = if env::consts::OS == "windows" {
@@ -473,7 +577,7 @@ pub(crate) fn start_virtiofsd(vm: &Vm, host: &QemuPlanContext, quiet: bool) -> b
         return false;
     };
     let log_path = vm.paths.state_dir.join("virtiofsd.log");
-    let log = match File::create(&log_path) {
+    let log = match create_truncated_file(&log_path) {
         Ok(log) => log,
         Err(error) => {
             if !quiet {
@@ -517,9 +621,9 @@ pub(crate) fn start_virtiofsd(vm: &Vm, host: &QemuPlanContext, quiet: bool) -> b
             return false;
         }
     };
-    if let Err(error) = fs::write(
-        vm.paths.virtiofs_pid_file(),
-        process_record(child.id() as i32),
+    if let Err(error) = write_atomic_file(
+        &vm.paths.virtiofs_pid_file(),
+        process_record(child.id() as i32).as_bytes(),
     ) {
         let _ = child.kill();
         let _ = child.wait();

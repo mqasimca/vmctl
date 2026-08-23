@@ -103,6 +103,111 @@ fn command_line_parses_viewer_override() {
 }
 
 #[test]
+fn set_command_parses_persistent_settings() {
+    let cli = Cli::try_parse_from([
+        "vmctl",
+        "set",
+        "ubuntu",
+        "--ram",
+        "2G",
+        "--cpu-cores",
+        "2",
+        "--disk-size",
+        "32G",
+        "--cpu-model",
+        "host",
+        "--cpu-pinning",
+        "0,1",
+        "--macaddr",
+        "52:54:00:12:34:56",
+        "--port-forward",
+        "8080:80",
+        "--boot-menu",
+        "on",
+        "--boot-once",
+        "cdrom",
+        "--disk-cache",
+        "none",
+        "--disk-aio",
+        "io_uring",
+        "--discard",
+        "ignore",
+    ])
+    .unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(VmCommand::Set {
+            vm,
+            ram: Some(ram),
+            cpu_cores: Some(2),
+            disk_size: Some(disk_size),
+            cpu_model: Some(cpu_model),
+            cpu_pinning: Some(cpu_pinning),
+            macaddr: Some(macaddr),
+            port_forwards,
+            boot_menu: Some(boot_menu),
+            boot_once: Some(boot_once),
+            disk_cache: Some(disk_cache),
+            disk_aio: Some(disk_aio),
+            discard: Some(discard),
+            ..
+        }) if vm == "ubuntu" && ram == "2G" && disk_size == "32G"
+            && cpu_model == "host" && cpu_pinning == "0,1"
+            && macaddr == "52:54:00:12:34:56" && port_forwards == ["8080:80"]
+            && boot_menu == "on" && boot_once == "cdrom" && disk_cache == "none"
+            && disk_aio == "io_uring" && discard == "ignore"
+    ));
+}
+
+#[test]
+fn status_command_parses_live() {
+    let cli = Cli::try_parse_from(["vmctl", "status", "ubuntu", "--live"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(VmCommand::Status { vm: Some(vm), live: true }) if vm == "ubuntu"
+    ));
+    assert!(Cli::try_parse_from(["vmctl", "status", "--live"]).is_err());
+}
+
+#[test]
+fn trailing_commands_do_not_consume_global_options() {
+    let cli = Cli::try_parse_from([
+        "vmctl",
+        "monitor",
+        "ubuntu",
+        "info status",
+        "--output",
+        "json",
+    ])
+    .unwrap();
+    assert_eq!(cli.output, OutputFormat::Json);
+    assert!(matches!(
+        cli.command,
+        Some(VmCommand::Monitor { command, .. }) if command == ["info status"]
+    ));
+
+    let cli = Cli::try_parse_from([
+        "vmctl",
+        "guest",
+        "ubuntu",
+        "exec",
+        "/bin/echo",
+        "hello",
+        "--output",
+        "json",
+    ])
+    .unwrap();
+    assert_eq!(cli.output, OutputFormat::Json);
+    assert!(matches!(
+        cli.command,
+        Some(VmCommand::Guest {
+            action: GuestAction::Exec { args, .. },
+            ..
+        }) if args == ["hello"]
+    ));
+}
+
+#[test]
 fn vm_ssh_does_not_persist_host_keys() {
     let options = vm_ssh_options();
     let null_device = if cfg!(windows) { "NUL" } else { "/dev/null" };
@@ -125,11 +230,120 @@ fn ssh_readiness_requires_an_ssh_banner() {
 }
 
 #[test]
-fn runtime_port_reads_saved_ssh_port() {
+fn spice_tcp_uri_brackets_ipv6_hosts() {
+    assert_eq!(spice_tcp_uri("::1", 5930), "spice://[::1]:5930");
+    assert_eq!(spice_tcp_uri("127.0.0.1", 5930), "spice://127.0.0.1:5930");
+    assert_eq!(connect_host("0.0.0.0"), "127.0.0.1");
+    assert_eq!(connect_host("remote"), "127.0.0.1");
+    assert_eq!(connect_host("::"), "::1");
+}
+
+#[test]
+fn desktop_exec_escapes_field_code_percent_signs() {
+    assert_eq!(
+        desktop_exec_quote(Path::new("/tmp/vm%f config")),
+        "\"/tmp/vm%%f config\""
+    );
+    assert_eq!(
+        desktop_quote(Path::new("/tmp/vm%f config")),
+        "\"/tmp/vm%f config\""
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn shortcut_refuses_a_symlink_without_touching_its_target() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(
+        root.path().join("demo.conf"),
+        "boot=legacy\nnetwork=none\npublic_dir=none\n",
+    )
+    .unwrap();
+    let victim = root.path().join("victim.txt");
+    fs::write(&victim, "keep me\n").unwrap();
+    let shortcut = root.path().join("demo.desktop");
+    std::os::unix::fs::symlink(&victim, &shortcut).unwrap();
+    let dirs = Dirs {
+        vm_dir: root.path().to_path_buf(),
+        state_root: root.path().join("state"),
+    };
+
+    assert!(shortcut_vm(&dirs, "demo", Some(shortcut), OutputFormat::Human).is_err());
+    assert_eq!(fs::read_to_string(victim).unwrap(), "keep me\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_file_writes_do_not_follow_symlinks() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(
+        root.path().join("demo.conf"),
+        "boot=legacy\nnetwork=none\npublic_dir=none\n",
+    )
+    .unwrap();
+    let vm = find(root.path(), &root.path().join("state"), "demo").unwrap();
+    fs::create_dir_all(&vm.paths.state_dir).unwrap();
+    let victim = root.path().join("victim.txt");
+    fs::write(&victim, "keep me\n").unwrap();
+    let log = vm.paths.state_dir.join("qemu.log");
+    std::os::unix::fs::symlink(&victim, &log).unwrap();
+
+    assert!(qemu::create_truncated_file(&log).is_err());
+    let pid_file = vm.paths.pid_file();
+    std::os::unix::fs::symlink(&victim, &pid_file).unwrap();
+    write_pid(&vm, i32::MAX).unwrap();
+
+    assert_eq!(fs::read_to_string(victim).unwrap(), "keep me\n");
+    assert!(
+        !fs::symlink_metadata(pid_file)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[test]
+fn runtime_listeners_are_authoritative_and_preserve_hosts() {
     let root = tempfile::tempdir().unwrap();
     let ports = root.path().join("ports");
-    fs::write(&ports, "spice,5930\nssh,22220\n").unwrap();
-    assert_eq!(runtime_port(&ports, "ssh"), Some(22220));
+    fs::write(&ports, "spice,5930\nssh,22220,192.0.2.10\n").unwrap();
+    assert_eq!(
+        runtime_listener(&ports, "ssh").unwrap(),
+        (true, Some((22220, Some("192.0.2.10".to_string()))))
+    );
+    assert_eq!(
+        runtime_listener(&ports, "spice").unwrap(),
+        (true, Some((5930, None)))
+    );
+
+    fs::write(&ports, "").unwrap();
+    assert_eq!(runtime_listener(&ports, "ssh").unwrap(), (true, None));
+}
+
+#[test]
+fn active_ssh_uses_runtime_absence_and_host_overrides() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(
+        root.path().join("demo.conf"),
+        "boot=legacy\nnetwork=user\nssh_port=22220\nssh_access=local\npublic_dir=none\n",
+    )
+    .unwrap();
+    let vm = find(root.path(), &root.path().join("state"), "demo").unwrap();
+    fs::create_dir_all(&vm.paths.state_dir).unwrap();
+    let ports = vm.paths.state_dir.join("ports");
+
+    fs::write(&ports, "").unwrap();
+    assert!(active_ssh_endpoint(&vm).is_err());
+
+    fs::write(&ports, "ssh,22333,192.0.2.10\n").unwrap();
+    assert_eq!(
+        active_ssh_endpoint(&vm).unwrap(),
+        ("192.0.2.10".to_string(), 22333)
+    );
+    assert_eq!(
+        runtime_ssh_host(&vm).unwrap(),
+        Some("192.0.2.10".to_string())
+    );
 }
 
 #[test]
@@ -156,6 +370,351 @@ fn launch_options_enable_gtk_clipboard() {
 }
 
 #[test]
+fn launch_options_override_resources() {
+    let root = tempfile::tempdir().unwrap();
+    let config_path = root.path().join("resources.conf");
+    fs::write(
+        &config_path,
+        "boot=legacy\nram=1G\ncpu_cores=1\nnetwork=none\npublic_dir=none\n",
+    )
+    .unwrap();
+    let mut vm = find(root.path(), root.path(), "resources").unwrap();
+
+    apply_launch_options(
+        &mut vm,
+        &LaunchOptions {
+            ram: Some("2G".to_string()),
+            cpu_cores: Some(2),
+            ..LaunchOptions::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(vm.config.ram.as_deref(), Some("2G"));
+    assert_eq!(vm.config.cpu_cores, Some(2));
+}
+
+#[test]
+fn launch_options_reject_global_flags_consumed_by_raw_arguments() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(
+        root.path().join("raw.conf"),
+        "boot=legacy\nnetwork=none\npublic_dir=none\n",
+    )
+    .unwrap();
+    let mut vm = find(root.path(), root.path(), "raw").unwrap();
+
+    let error = apply_launch_options(
+        &mut vm,
+        &LaunchOptions {
+            extra_args: vec!["--output=json".to_string()],
+            ..LaunchOptions::default()
+        },
+    )
+    .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("global options before --extra-args")
+    );
+}
+
+#[test]
+fn start_preflight_preserves_disk_and_log_on_host_validation_failure() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("installer.iso"), []).unwrap();
+    fs::write(
+        root.path().join("preflight.conf"),
+        "boot=legacy\niso=installer.iso\ndisk_size=1M\nnetwork=none\npublic_dir=none\n",
+    )
+    .unwrap();
+    let mut vm = find(root.path(), &root.path().join("state"), "preflight").unwrap();
+    vm.config.arch = "vmctl-test-missing".to_string();
+    fs::create_dir_all(&vm.paths.state_dir).unwrap();
+    let log = vm.paths.state_dir.join("qemu.log");
+    fs::write(&log, "previous startup diagnostics\n").unwrap();
+    fs::write(vm.paths.ipc_state(), "stale runtime state").unwrap();
+
+    let error = start_vm_loaded(&vm, OutputFormat::Human, None).unwrap_err();
+
+    assert!(matches!(
+        error,
+        Error::CommandUnavailable { command, .. }
+            if command == "qemu-system-vmctl-test-missing"
+    ));
+    assert!(!vm.config.disk_img.exists());
+    assert_eq!(
+        fs::read_to_string(log).unwrap(),
+        "previous startup diagnostics\n"
+    );
+    assert!(!vm.paths.ipc_state().exists());
+}
+
+#[test]
+fn set_vm_persists_cpu_and_ram() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(
+        root.path().join("resources.conf"),
+        "boot=legacy\nram=1G\ncpu_cores=1\nnetwork=none\npublic_dir=none\n",
+    )
+    .unwrap();
+    let dirs = Dirs {
+        vm_dir: root.path().to_path_buf(),
+        state_root: root.path().join("state"),
+    };
+
+    set_vm(
+        &dirs,
+        "resources",
+        Some("2G"),
+        Some(2),
+        None,
+        Some("host"),
+        Some("0,1"),
+        Some("52:54:00:12:34:56"),
+        Some("none"),
+        &["8080:80".to_string()],
+        Some("on"),
+        Some("cdrom"),
+        Some("none"),
+        Some("io_uring"),
+        Some("ignore"),
+        OutputFormat::Json,
+    )
+    .unwrap();
+
+    let vm = find(&dirs.vm_dir, &dirs.state_root, "resources").unwrap();
+    assert_eq!(vm.config.ram.as_deref(), Some("2G"));
+    assert_eq!(vm.config.cpu_cores, Some(2));
+    assert_eq!(vm.config.cpu_model.as_deref(), Some("host"));
+    assert_eq!(vm.config.cpu_pinning.as_deref(), Some("0,1"));
+    assert_eq!(vm.config.macaddr.as_deref(), Some("52:54:00:12:34:56"));
+    assert_eq!(vm.config.port_forwards, [(8080, 80)]);
+    assert!(vm.config.boot_menu);
+    assert_eq!(vm.config.boot_once.as_deref(), Some("cdrom"));
+    assert_eq!(vm.config.disk_cache, "none");
+    assert_eq!(vm.config.disk_aio, "io_uring");
+    assert_eq!(vm.config.discard, "ignore");
+}
+
+#[test]
+fn set_vm_can_clear_port_forwards() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(
+        root.path().join("clear-forwards.conf"),
+        "boot=legacy\nport_forwards=(\"8080:80\")\nnetwork=none\npublic_dir=none\n",
+    )
+    .unwrap();
+    let dirs = Dirs {
+        vm_dir: root.path().to_path_buf(),
+        state_root: root.path().join("state"),
+    };
+
+    set_vm(
+        &dirs,
+        "clear-forwards",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        &["none".to_string()],
+        None,
+        None,
+        None,
+        None,
+        None,
+        OutputFormat::Json,
+    )
+    .unwrap();
+
+    assert!(
+        find(&dirs.vm_dir, &dirs.state_root, "clear-forwards")
+            .unwrap()
+            .config
+            .port_forwards
+            .is_empty()
+    );
+}
+
+#[test]
+fn set_vm_rejects_all_updates_before_writing_any() {
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("unchanged.conf");
+    let original = "boot=legacy\nram=1G\nnetwork=none\npublic_dir=none\n";
+    fs::write(&config, original).unwrap();
+    let dirs = Dirs {
+        vm_dir: root.path().to_path_buf(),
+        state_root: root.path().join("state"),
+    };
+
+    assert!(
+        set_vm(
+            &dirs,
+            "unchanged",
+            Some("2G"),
+            None,
+            None,
+            Some("host\ncpu_cores=99"),
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+            OutputFormat::Human,
+        )
+        .is_err()
+    );
+    assert_eq!(fs::read_to_string(config).unwrap(), original);
+}
+
+#[cfg(unix)]
+#[test]
+fn set_vm_refuses_a_symlinked_config_without_touching_its_target() {
+    let root = tempfile::tempdir().unwrap();
+    let victim = root.path().join("victim.txt");
+    fs::write(&victim, "keep me\n").unwrap();
+    let config = root.path().join("linked.conf");
+    std::os::unix::fs::symlink(&victim, &config).unwrap();
+    let dirs = Dirs {
+        vm_dir: root.path().to_path_buf(),
+        state_root: root.path().join("state"),
+    };
+
+    assert!(find(root.path(), &dirs.state_root, config.to_str().unwrap()).is_err());
+    assert!(
+        set_vm(
+            &dirs,
+            "linked",
+            Some("2G"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+            OutputFormat::Human,
+        )
+        .is_err()
+    );
+    assert_eq!(fs::read_to_string(victim).unwrap(), "keep me\n");
+}
+
+#[test]
+fn set_vm_rejects_cpu_pinning_mismatches_before_writing() {
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("pinned.conf");
+    let dirs = Dirs {
+        vm_dir: root.path().to_path_buf(),
+        state_root: root.path().join("state"),
+    };
+    let set_cores = |pinning| {
+        set_vm(
+            &dirs,
+            "pinned",
+            None,
+            Some(2),
+            None,
+            None,
+            pinning,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+            OutputFormat::Human,
+        )
+    };
+
+    let original = "boot=legacy\nnetwork=none\npublic_dir=none\n";
+    fs::write(&config, original).unwrap();
+    assert!(set_cores(Some("0")).is_err());
+    assert_eq!(fs::read_to_string(&config).unwrap(), original);
+
+    let original = "boot=legacy\ncpu_cores=1\ncpu_pinning=0\nnetwork=none\npublic_dir=none\n";
+    fs::write(&config, original).unwrap();
+    assert!(set_cores(None).is_err());
+    assert_eq!(fs::read_to_string(config).unwrap(), original);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn set_vm_pinning_uses_the_qemu_default_core_count() {
+    let cores = qemu::default_cpu_cores() as usize;
+    let mut ids = Vec::with_capacity(cores);
+    for range in process_allowed_cpu_spec().unwrap().split(',') {
+        let (start, end) = range
+            .split_once('-')
+            .map_or((range, range), |(start, end)| (start, end));
+        for id in start.trim().parse::<u32>().unwrap()..=end.trim().parse::<u32>().unwrap() {
+            ids.push(id);
+            if ids.len() == cores {
+                break;
+            }
+        }
+        if ids.len() == cores {
+            break;
+        }
+    }
+    assert_eq!(ids.len(), cores);
+    let pinning = ids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+
+    let root = tempfile::tempdir().unwrap();
+    fs::write(
+        root.path().join("default-pinning.conf"),
+        "boot=legacy\nnetwork=none\npublic_dir=none\n",
+    )
+    .unwrap();
+    let dirs = Dirs {
+        vm_dir: root.path().to_path_buf(),
+        state_root: root.path().join("state"),
+    };
+    set_vm(
+        &dirs,
+        "default-pinning",
+        None,
+        None,
+        None,
+        None,
+        Some(&pinning),
+        None,
+        None,
+        &[],
+        None,
+        None,
+        None,
+        None,
+        None,
+        OutputFormat::Human,
+    )
+    .unwrap();
+    assert_eq!(
+        find(&dirs.vm_dir, &dirs.state_root, "default-pinning")
+            .unwrap()
+            .config
+            .cpu_pinning
+            .as_deref(),
+        Some(pinning.as_str())
+    );
+}
+
+#[test]
 fn guest_exec_accepts_hyphenated_guest_arguments() {
     let cli = Cli::try_parse_from([
         "vmctl",
@@ -163,6 +722,7 @@ fn guest_exec_accepts_hyphenated_guest_arguments() {
         "ubuntu",
         "exec",
         "/bin/sh",
+        "--",
         "-c",
         "echo hello",
     ])
@@ -238,6 +798,15 @@ fn log_tail_is_bounded_and_redacted() {
             "last token=<redacted>"
         ]
     );
+}
+
+#[test]
+fn file_tail_limits_bytes_read() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("large.log");
+    fs::write(&path, b"0123456789").unwrap();
+
+    assert_eq!(read_file_tail(&path, 4).unwrap(), (b"6789".to_vec(), true));
 }
 
 #[test]
@@ -368,9 +937,20 @@ fn create_command_is_typed() {
         "ubuntu-lab",
         "--from",
         "ubuntu-24.04-desktop-amd64--sha256-123456789abc.iso",
+        "--ram",
+        "4G",
+        "--cpu-cores",
+        "2",
+        "--disk-size",
+        "32G",
     ])
     .unwrap();
-    assert!(matches!(cli.command, Some(VmCommand::Create(_))));
+    let Some(VmCommand::Create(args)) = cli.command else {
+        panic!("expected create command");
+    };
+    assert_eq!(args.ram.as_deref(), Some("4G"));
+    assert_eq!(args.cpu_cores, Some(2));
+    assert_eq!(args.disk_size.as_deref(), Some("32G"));
 }
 
 #[test]

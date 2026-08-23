@@ -21,7 +21,7 @@ pub(crate) fn send_monitor_command(vm: &Vm, command: &str) -> Result<String> {
         "telnet" => {
             let address = format!(
                 "{}:{}",
-                qemu_host(&vm.config.monitor_telnet_host),
+                qemu_host(monitor_connect_host(&vm.config.monitor_telnet_host)),
                 vm.config.monitor_telnet_port
             );
             let deadline = qmp_deadline()?;
@@ -43,6 +43,14 @@ pub(crate) fn send_monitor_command(vm: &Vm, command: &str) -> Result<String> {
         }
     };
     Ok(clean_monitor_output(&response))
+}
+
+pub(super) fn monitor_connect_host(host: &str) -> &str {
+    match host {
+        "0.0.0.0" => "127.0.0.1",
+        "::" => "::1",
+        host => host,
+    }
 }
 
 pub(super) fn connect_monitor(address: &str, deadline: Instant) -> Result<TcpStream> {

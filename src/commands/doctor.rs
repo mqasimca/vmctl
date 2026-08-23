@@ -649,6 +649,7 @@ pub(super) fn doctor(dirs: &Dirs, name: Option<&str>, output: OutputFormat) -> R
         .filter(|check| check["status"] == "warn")
         .count();
     let report = json!({
+        "ok": errors == 0,
         "scope": {"vm": name},
         "checks": checks,
         "summary": {"errors": errors, "warnings": warnings},
@@ -728,8 +729,7 @@ pub(super) fn print_doctor_human(report: &Value) {
 }
 
 pub(super) fn read_diagnostic_tail(path: &Path) -> Option<String> {
-    let bytes = fs::read(path).ok()?;
-    let start = bytes.len().saturating_sub(8 * 1024);
-    let tail = String::from_utf8_lossy(&bytes[start..]);
+    let (bytes, _) = read_file_tail(path, 8 * 1024).ok()?;
+    let tail = String::from_utf8_lossy(&bytes);
     Some(redact_diagnostic(&tail))
 }

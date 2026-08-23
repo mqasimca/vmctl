@@ -44,7 +44,7 @@ pub(crate) fn schema() -> Value {
         },
         "commands": {
             "read_only": ["list", "status", "plan", "logs", "report", "doctor", "schema"],
-            "state_changing": ["create", "start", "stop", "kill", "restart", "snapshot", "disk", "delete-disk", "delete-vm", "shortcut", "host"],
+            "state_changing": ["create", "set", "start", "stop", "kill", "restart", "snapshot", "disk", "delete-disk", "delete-vm", "shortcut", "host"],
             "conditional": ["get", "guest", "monitor"],
             "native_output": ["ssh", "completion"]
         },

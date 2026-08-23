@@ -205,67 +205,87 @@ pub(super) fn download_windows(
             config_file.display()
         )));
     }
-    fs::create_dir_all(&target_dir).map_err(|error| Error::io(target_dir.display(), error))?;
-    let file_name = file_name_from_url(&image.0).unwrap_or_else(|| format!("{os}-{release}.iso"));
-    let cached = if create_config {
-        Some(cache_url(
-            &root,
-            &image.0,
-            &file_name,
-            ImageKind::Iso,
-            None,
-            args.insecure,
-            args.refresh_cache,
-        )?)
-    } else {
-        None
-    };
-    let iso = cached
-        .as_ref()
-        .map(|cache| cache.path.clone())
-        .unwrap_or_else(|| target_dir.join(file_name));
-    if !create_config {
-        download_file(&image.0, &iso, args.insecure)?;
-    }
-    let (fixed_iso, unattended_iso) = if create_config {
-        let fixed_iso = cache_url(
-            &root,
-            "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso",
-            "virtio-win.iso",
-            ImageKind::Iso,
-            None,
-            args.insecure,
-            args.refresh_cache,
-        )?
-        .path;
-        let unattended_iso = if args.disable_unattended {
-            None
+    let target_dir_existed = target_dir.exists();
+    let mut written_config = None;
+    let provision = (|| {
+        fs::create_dir_all(&target_dir).map_err(|error| Error::io(target_dir.display(), error))?;
+        let file_name =
+            file_name_from_url(&image.0).unwrap_or_else(|| format!("{os}-{release}.iso"));
+        let cached = if create_config {
+            Some(cache_url(
+                &root,
+                &image.0,
+                &file_name,
+                ImageKind::Iso,
+                None,
+                args.insecure,
+                args.refresh_cache,
+            )?)
         } else {
-            Some(create_unattended_iso(&target_dir, args.insecure)?)
+            None
         };
-        (Some(fixed_iso), unattended_iso)
-    } else {
-        (None, None)
-    };
-    let config = if create_config {
-        let config = write_vm_config(
-            &root,
-            &name,
-            os,
-            release,
-            edition.as_deref(),
-            architecture,
-            &iso,
-        )?;
-        if let Some(fixed_iso) = fixed_iso.as_deref() {
-            append_iso(&root, &config, "fixed_iso", fixed_iso)?;
+        let iso = cached
+            .as_ref()
+            .map(|cache| cache.path.clone())
+            .unwrap_or_else(|| target_dir.join(file_name));
+        if !create_config {
+            download_file(&image.0, &iso, args.insecure)?;
         }
-        if let Some(unattended_iso) = unattended_iso.as_deref() {
-            append_iso(&root, &config, "unattended_iso", unattended_iso)?;
+        let (fixed_iso, unattended_iso) = if create_config {
+            let fixed_iso = cache_url(
+                &root,
+                "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso",
+                "virtio-win.iso",
+                ImageKind::Iso,
+                None,
+                args.insecure,
+                args.refresh_cache,
+            )?
+            .path;
+            let unattended_iso = if args.disable_unattended {
+                None
+            } else {
+                Some(create_unattended_iso(&target_dir, args.insecure)?)
+            };
+            (Some(fixed_iso), unattended_iso)
+        } else {
+            (None, None)
+        };
+        let config = if create_config {
+            let config = write_vm_config(
+                &root,
+                &name,
+                os,
+                release,
+                edition.as_deref(),
+                architecture,
+                &iso,
+                VmResources::default(),
+            )?;
+            written_config = Some(config.clone());
+            if let Some(fixed_iso) = fixed_iso.as_deref() {
+                append_iso(&root, &config, "fixed_iso", fixed_iso)?;
+            }
+            if let Some(unattended_iso) = unattended_iso.as_deref() {
+                append_iso(&root, &config, "unattended_iso", unattended_iso)?;
+            }
+            Some(config)
+        } else {
+            None
+        };
+        Ok((iso, fixed_iso, unattended_iso, config, cached))
+    })();
+    let (iso, fixed_iso, unattended_iso, config, cached) = match provision {
+        Ok(created) => created,
+        Err(error) => {
+            if create_config && !target_dir_existed {
+                let _ = fs::remove_dir_all(&target_dir);
+            }
+            if let Some(config) = written_config {
+                let _ = fs::remove_file(config);
+            }
+            return Err(error);
         }
-        Some(config)
-    } else {
-        None
     };
     let result = json!({
         "os": os,
@@ -425,10 +445,7 @@ pub(super) fn append_iso(root: &Path, config: &Path, key: &str, image: &Path) ->
         .unwrap_or(image)
         .to_string_lossy()
         .replace('\\', "/");
-    let mut file = OpenOptions::new()
-        .append(true)
-        .open(config)
-        .map_err(|error| Error::io(config.display(), error))?;
+    let mut file = crate::config::open_config_for_append(config)?;
     writeln!(file, "{key}=\"{}\"", config_value(&relative))
         .map_err(|error| Error::io(config.display(), error))
 }

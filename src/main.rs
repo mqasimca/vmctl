@@ -45,7 +45,11 @@ fn main() -> std::process::ExitCode {
         }
         Err(error) => error.exit(),
     };
-    let output = cli.output;
+    let output = if cli.output == OutputFormat::Json || json_requested() {
+        OutputFormat::Json
+    } else {
+        cli.output
+    };
     match vmctl::run(cli) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
@@ -101,6 +105,18 @@ mod tests {
         ));
         assert!(json_requested_from(
             ["--output=json".to_string()].into_iter()
+        ));
+        assert!(json_requested_from(
+            [
+                "plan".to_string(),
+                "vm".to_string(),
+                "--extra-args".to_string(),
+                "-msg".to_string(),
+                "timestamp=on".to_string(),
+                "--output".to_string(),
+                "json".to_string(),
+            ]
+            .into_iter()
         ));
     }
 }

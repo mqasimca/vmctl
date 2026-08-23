@@ -1,5 +1,10 @@
-use std::collections::BTreeMap;
-use std::fs;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(windows)]
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
@@ -34,9 +39,14 @@ pub struct VmConfig {
     pub img: Option<PathBuf>,
     pub macos_release: Option<String>,
     pub boot: String,
+    pub boot_menu: bool,
+    pub boot_once: Option<String>,
     pub ram: Option<String>,
     pub cpu_cores: Option<u32>,
     pub cpu_model: Option<String>,
+    pub disk_cache: String,
+    pub disk_aio: String,
+    pub discard: String,
     pub display: String,
     pub viewer: String,
     pub access: String,
@@ -147,11 +157,28 @@ pub fn discover(root: &Path, state_root: &Path) -> Result<Vec<Vm>> {
 
 pub fn find(root: &Path, state_root: &Path, name_or_path: &str) -> Result<Vm> {
     let candidate = Path::new(name_or_path);
-    if candidate.is_file() {
-        let config_path =
-            fs::canonicalize(candidate).map_err(|error| Error::io(candidate.display(), error))?;
-        let config_root = config_path.parent().unwrap_or(root).to_path_buf();
-        return load_vm(&config_root, state_root, config_path);
+    match fs::symlink_metadata(candidate) {
+        Ok(metadata) if is_unsafe_config_metadata(&metadata) => {
+            return Err(Error::message(format!(
+                "refusing to use non-regular configuration {}",
+                candidate.display()
+            )));
+        }
+        Ok(metadata) if metadata.is_file() => {
+            let parent = candidate
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let config_root =
+                fs::canonicalize(parent).map_err(|error| Error::io(parent.display(), error))?;
+            let config_path = config_root.join(
+                candidate
+                    .file_name()
+                    .expect("a regular file has a file name"),
+            );
+            return load_vm(&config_root, state_root, config_path);
+        }
+        Ok(_) | Err(_) => {}
     }
 
     let wanted = name_or_path.strip_suffix(".conf").unwrap_or(name_or_path);
@@ -159,6 +186,55 @@ pub fn find(root: &Path, state_root: &Path, name_or_path: &str) -> Result<Vm> {
         .into_iter()
         .find(|vm| vm.config.name == wanted)
         .ok_or_else(|| Error::vm_not_found(name_or_path, root))
+}
+
+fn read_config(path: &Path) -> Result<String> {
+    let mut file = open_config(path, false).map_err(|error| Error::io(path.display(), error))?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)
+        .map_err(|error| Error::io(path.display(), error))?;
+    Ok(contents)
+}
+
+pub(crate) fn open_config_for_append(path: &Path) -> Result<File> {
+    open_config(path, true).map_err(|error| Error::io(path.display(), error))
+}
+
+fn open_config(path: &Path, append: bool) -> io::Result<File> {
+    let metadata = fs::symlink_metadata(path)?;
+    if is_unsafe_config_metadata(&metadata) || !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to open a non-regular configuration file",
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).append(append);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    #[cfg(windows)]
+    options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if is_unsafe_config_metadata(&metadata) || !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to open a non-regular configuration file",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn is_unsafe_config_metadata(metadata: &fs::Metadata) -> bool {
+    metadata.file_attributes()
+        & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+        != 0
+}
+
+#[cfg(not(windows))]
+fn is_unsafe_config_metadata(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
 }
 
 pub fn load_vm(root: &Path, state_root: &Path, config_path: PathBuf) -> Result<Vm> {
@@ -176,15 +252,18 @@ pub fn load_vm(root: &Path, state_root: &Path, config_path: PathBuf) -> Result<V
     if name == "."
         || name == ".."
         || name.chars().any(|character| {
-            character == ',' || character == '=' || character == '\\' || character.is_control()
+            character == ','
+                || character == '='
+                || character == '\\'
+                || character.is_whitespace()
+                || character.is_control()
         })
     {
         return Err(Error::message(format!(
             "VM name '{name}' contains characters unsafe for QEMU process naming"
         )));
     }
-    let contents = fs::read_to_string(&config_path)
-        .map_err(|error| Error::io(config_path.display(), error))?;
+    let contents = read_config(&config_path)?;
     let values = parse_config(&contents);
     let config = VmConfig::from_values(name, config_path, root, &values)?;
     let paths = VmPaths::new(state_root, &config.name);
@@ -273,9 +352,14 @@ impl VmConfig {
             img: optional_path(root, values.get("img"))?,
             macos_release: optional_string(values, "macos_release"),
             boot: value_or(values, "boot", "efi").to_ascii_lowercase(),
+            boot_menu: setting_bool(values, "boot_menu", false, &config_path)?,
+            boot_once: optional_string(values, "boot_once"),
             ram: optional_string(values, "ram"),
             cpu_cores: optional_u32(values, "cpu_cores", &config_path)?,
             cpu_model: optional_string(values, "cpu_model"),
+            disk_cache: value_or(values, "disk_cache", "writeback").to_ascii_lowercase(),
+            disk_aio: value_or(values, "disk_aio", "threads").to_ascii_lowercase(),
+            discard: value_or(values, "discard", "unmap").to_ascii_lowercase(),
             display,
             viewer: value_or(values, "viewer", "remote-viewer").to_ascii_lowercase(),
             access: value_or(values, "access", "local").to_ascii_lowercase(),
@@ -348,7 +432,7 @@ impl VmConfig {
             tpm: setting_bool(values, "tpm", false, &config_path)?,
             status_quo: false,
             ignore_tsc_warning: setting_bool(values, "ignore_tsc_warning", false, &config_path)?,
-            cpu_pinning: None,
+            cpu_pinning: optional_string(values, "cpu_pinning"),
             extra_args: parse_tokens(values.get("extra_args")),
         };
         config.validate()?;
@@ -375,6 +459,14 @@ impl VmConfig {
             ));
         }
         validate_one_of(&self.config_path, "boot", &self.boot, &["efi", "legacy"])?;
+        if let Some(boot_once) = &self.boot_once {
+            validate_one_of(
+                &self.config_path,
+                "boot_once",
+                boot_once,
+                &["disk", "cdrom", "network"],
+            )?;
+        }
         if self.guest_os == "macos" && self.boot != "efi" {
             return Err(Error::config(
                 &self.config_path,
@@ -441,6 +533,36 @@ impl VmConfig {
             &self.preallocation,
             &["off", "metadata", "falloc", "full"],
         )?;
+        if self.disk_format == "raw" && self.preallocation == "metadata" {
+            return Err(Error::config(
+                &self.config_path,
+                "preallocation=metadata is unsupported for raw disks",
+            ));
+        }
+        validate_one_of(
+            &self.config_path,
+            "disk_cache",
+            &self.disk_cache,
+            &["writeback", "none", "writethrough", "directsync"],
+        )?;
+        validate_one_of(
+            &self.config_path,
+            "disk_aio",
+            &self.disk_aio,
+            &["threads", "native", "io_uring"],
+        )?;
+        validate_one_of(
+            &self.config_path,
+            "discard",
+            &self.discard,
+            &["unmap", "ignore"],
+        )?;
+        if self.disk_aio == "native" && !matches!(self.disk_cache.as_str(), "none" | "directsync") {
+            return Err(Error::config(
+                &self.config_path,
+                "disk_aio=native requires disk_cache=none or directsync",
+            ));
+        }
         for (key, value) in [("access", &self.access), ("ssh_access", &self.ssh_access)] {
             if !matches!(value.as_str(), "local" | "remote") && !valid_host_or_address(value) {
                 return Err(Error::config(
@@ -506,6 +628,15 @@ impl VmConfig {
                 "ssh and SPICE ports must be greater than zero",
             ));
         }
+        let mut forwarded_hosts = BTreeSet::new();
+        for (host, _) in &self.port_forwards {
+            if !forwarded_hosts.insert(host) {
+                return Err(Error::config(
+                    &self.config_path,
+                    format!("port_forwards repeats host port {host}"),
+                ));
+            }
+        }
         if let Some(macaddr) = &self.macaddr
             && (macaddr.split(':').count() != 6
                 || macaddr
@@ -547,6 +678,9 @@ impl VmConfig {
                 "cpu_cores, width, height, and max_outputs must be greater than zero",
             ));
         }
+        if let Some(ram) = &self.ram {
+            validate_ram_size(ram)?;
+        }
         if self.disk_format.is_empty() || self.disk_size.is_empty() {
             return Err(Error::config(
                 &self.config_path,
@@ -554,11 +688,7 @@ impl VmConfig {
             ));
         }
         validate_disk_format_value(&self.config_path, &self.disk_format)?;
-        if let Some(argument) = self
-            .extra_args
-            .iter()
-            .find(|argument| unsafe_extra_argument(argument))
-        {
+        if let Some(argument) = unsafe_extra_argument(&self.extra_args) {
             return Err(Error::config(
                 &self.config_path,
                 format!(
@@ -570,33 +700,158 @@ impl VmConfig {
     }
 }
 
-fn unsafe_extra_argument(argument: &str) -> bool {
-    let option = argument
-        .split_once('=')
-        .map_or(argument, |(option, _)| option);
-    matches!(
-        option,
-        "-name"
-            | "-pidfile"
-            | "-daemonize"
-            | "-display"
-            | "-spice"
-            | "-qmp"
-            | "-mon"
-            | "-monitor"
-            | "-serial"
-            | "-drive"
-            | "-blockdev"
-            | "-device"
-            | "-object"
-            | "-fsdev"
-            | "-netdev"
-            | "-nic"
-            | "-chardev"
-            | "-bios"
-            | "-global"
-            | "-S"
-    )
+pub(crate) fn validate_ram_size(size: &str) -> Result<()> {
+    let suffix = size
+        .chars()
+        .last()
+        .filter(|character| character.is_ascii_alphabetic());
+    let value = suffix.map_or(size, |suffix| &size[..size.len() - suffix.len_utf8()]);
+    if value.is_empty()
+        || matches!(value.chars().next(), Some('+' | '-'))
+        || suffix.is_some_and(|suffix| {
+            !matches!(
+                suffix.to_ascii_uppercase(),
+                'B' | 'K' | 'M' | 'G' | 'T' | 'P' | 'E'
+            )
+        })
+        || !value
+            .chars()
+            .all(|character| character.is_ascii_digit() || character == '.')
+        || value
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .is_none()
+    {
+        return Err(Error::message(format!(
+            "invalid RAM size '{size}'; use a positive QEMU size such as 8G"
+        )));
+    }
+    Ok(())
+}
+
+fn unsafe_extra_argument(arguments: &[String]) -> Option<&str> {
+    let mut value_for = None;
+    for argument in arguments {
+        if let Some(option) = value_for.take() {
+            if argument.is_empty() || argument.starts_with('-') {
+                return Some(option);
+            }
+            continue;
+        }
+
+        let option = argument
+            .split_once('=')
+            .map_or(argument.as_str(), |(option, _)| option);
+        if !option.starts_with('-') || option.starts_with("--") || option == "-" {
+            return Some(argument);
+        }
+        if matches!(
+            option,
+            "-name"
+                | "-pidfile"
+                | "-daemonize"
+                | "-readconfig"
+                | "-plugin"
+                | "-incoming"
+                | "-run-with"
+                | "-chroot"
+                | "-runas"
+                | "-user"
+                | "-semihosting"
+                | "-semihosting-config"
+                | "-display"
+                | "-spice"
+                | "-qmp"
+                | "-qmp-pretty"
+                | "-qtest"
+                | "-qtest-log"
+                | "-mon"
+                | "-monitor"
+                | "-serial"
+                | "-parallel"
+                | "-debugcon"
+                | "-vnc"
+                | "-gdb"
+                | "-s"
+                | "-nographic"
+                | "-drive"
+                | "-blockdev"
+                | "-device"
+                | "-object"
+                | "-fsdev"
+                | "-virtfs"
+                | "-net"
+                | "-netdev"
+                | "-nic"
+                | "-chardev"
+                | "-bios"
+                | "-pflash"
+                | "-hda"
+                | "-hdb"
+                | "-hdc"
+                | "-hdd"
+                | "-fda"
+                | "-fdb"
+                | "-cdrom"
+                | "-mtdblock"
+                | "-sd"
+                | "-usbdevice"
+                | "-tpmdev"
+                | "-fw_cfg"
+                | "-add-fd"
+                | "-global"
+                | "-set"
+                | "-machine"
+                | "-M"
+                | "-accel"
+                | "-enable-kvm"
+                | "-cpu"
+                | "-smp"
+                | "-numa"
+                | "-m"
+                | "-mem-path"
+                | "-boot"
+                | "-kernel"
+                | "-initrd"
+                | "-append"
+                | "-dtb"
+                | "-loadvm"
+                | "-snapshot"
+                | "-rtc"
+                | "-icount"
+                | "-k"
+                | "-audio"
+                | "-audiodev"
+                | "-vga"
+                | "-usb"
+                | "-nodefaults"
+                | "-no-user-config"
+                | "-no-reboot"
+                | "-no-shutdown"
+                | "-action"
+                | "-watchdog-action"
+                | "-preconfig"
+                | "-sandbox"
+                | "-D"
+                | "-trace"
+                | "-dump-vmstate"
+                | "-perfmap"
+                | "-jitdump"
+                | "-S"
+        ) {
+            return Some(argument);
+        }
+        if !argument.contains('=')
+            && matches!(
+                option,
+                "-msg" | "-d" | "-dfilter" | "-seed" | "-compat" | "-echr" | "-uuid"
+            )
+        {
+            value_for = Some(argument.as_str());
+        }
+    }
+    value_for
 }
 
 #[cfg(test)]

@@ -123,6 +123,104 @@ fn validates_windows_download_handshake_tokens() {
 fn insecure_curl_mode_is_explicit() {
     assert_eq!(curl_security_args(false), &[] as &[&str]);
     assert_eq!(curl_security_args(true), &["--insecure"]);
+    assert_eq!(NULL_DEVICE, if cfg!(windows) { "NUL" } else { "/dev/null" });
+}
+
+#[test]
+fn downloads_never_touch_existing_destinations() {
+    let root = tempdir().unwrap();
+    let destination = root.path().join("image.iso");
+    fs::write(&destination, b"keep me").unwrap();
+
+    let error = download_file("invalid://url", &destination, false).unwrap_err();
+    assert!(error.to_string().contains("already exists"));
+    let error = download_file_with_headers(
+        "invalid://url",
+        &destination,
+        &["Authorization: secret".to_string()],
+        false,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("already exists"));
+    assert_eq!(fs::read(&destination).unwrap(), b"keep me");
+}
+
+#[test]
+fn staged_download_cannot_replace_a_raced_destination() {
+    let root = tempdir().unwrap();
+    let destination = root.path().join("image.iso");
+    let (temporary, mut file) = stage_new_file(&destination).unwrap();
+    file.write_all(b"new").unwrap();
+    drop(file);
+    fs::write(&destination, b"existing").unwrap();
+
+    assert!(commit_new_file(&temporary, &destination).is_err());
+    assert_eq!(fs::read(destination).unwrap(), b"existing");
+    assert!(!temporary.exists());
+}
+
+#[test]
+fn macos_conversion_refuses_an_existing_recovery_image_before_network_access() {
+    let root = tempdir().unwrap();
+    let vm_dir = root.path().join("vms");
+    let target = vm_dir.join("macos-test");
+    fs::create_dir_all(&target).unwrap();
+    let image = target.join("RecoveryImage.img");
+    fs::write(&image, b"existing").unwrap();
+    let args = GetArgs {
+        name: Some("macos-test".to_string()),
+        ..GetArgs::default()
+    };
+    let dirs = Dirs {
+        vm_dir,
+        state_root: root.path().join("state"),
+    };
+
+    let error =
+        download_macos(&args, &dirs, "sequoia", "amd64", true, OutputFormat::Human).unwrap_err();
+    assert!(error.to_string().contains("already exists"));
+    assert_eq!(fs::read(image).unwrap(), b"existing");
+}
+
+#[test]
+fn macos_recovery_conversion_publishes_a_new_file_without_replacing_one() {
+    if !command_exists("qemu-img") {
+        return;
+    }
+    let root = tempdir().unwrap();
+    let source = root.path().join("RecoveryImage.raw");
+    let destination = root.path().join("RecoveryImage.img");
+    fs::write(&source, vec![0; 1024]).unwrap();
+
+    convert_recovery_image(&source, &destination).unwrap();
+    assert_eq!(fs::metadata(&destination).unwrap().len(), 1024);
+    let error = convert_recovery_image(&source, &destination).unwrap_err();
+    assert!(error.to_string().contains("already exists"));
+    assert_eq!(fs::metadata(destination).unwrap().len(), 1024);
+}
+
+#[cfg(unix)]
+#[test]
+fn windows_iso_append_refuses_a_symlinked_config() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempdir().unwrap();
+    let victim = root.path().join("victim.conf");
+    let config = root.path().join("vm.conf");
+    fs::write(&victim, b"original\n").unwrap();
+    symlink(&victim, &config).unwrap();
+
+    assert!(append_iso(root.path(), &config, "fixed_iso", Path::new("fixed.iso")).is_err());
+    assert_eq!(fs::read(victim).unwrap(), b"original\n");
+}
+
+#[test]
+fn homepage_launcher_uses_a_real_windows_executable() {
+    let (command, arguments) = homepage_opener();
+    assert!(!command.is_empty());
+    if cfg!(windows) {
+        assert_eq!(arguments, ["/C", "start", ""]);
+    }
 }
 
 #[test]
@@ -160,6 +258,25 @@ fn generated_configs_get_current_arch_and_debian_defaults() {
         vec![("secureboot", "on"), ("tpm", "on")]
     );
     assert_eq!(config_tweaks("debian", "11"), vec![("secureboot", "on")]);
+}
+
+#[test]
+fn create_resources_reject_relative_sizes_and_zero_cpus() {
+    let mut args = CreateArgs {
+        name: "test".to_string(),
+        image: "test.iso".to_string(),
+        ram: None,
+        cpu_cores: Some(1),
+        disk_size: Some("+4G".to_string()),
+        disk_mode: None,
+        ssh_keys: Vec::new(),
+        hostname: None,
+        network_config: None,
+    };
+    assert!(VmResources::from_create(&args).is_err());
+    args.disk_size = None;
+    args.cpu_cores = Some(0);
+    assert!(VmResources::from_create(&args).is_err());
 }
 
 #[test]
@@ -208,6 +325,7 @@ fn parses_provider_checksums_without_shell_parsing() {
 #[test]
 fn unsafe_custom_names_are_rejected() {
     assert!(validate_vm_name("../vm").is_err());
+    assert!(validate_vm_name("unusable vm").is_err());
     assert!(validate_vm_name("good-vm").is_ok());
 }
 
@@ -227,11 +345,32 @@ fn generated_config_is_relative_and_not_overwritten() {
         None,
         "amd64",
         &image,
+        VmResources::default(),
     )
     .unwrap();
     let contents = fs::read_to_string(&config).unwrap();
     assert!(contents.contains("iso=\"ubuntu-24.04/ubuntu.iso\""));
     assert!(contents.contains("disk_img=\"ubuntu-24.04/disk.qcow2\""));
+    let resources = VmResources {
+        ram: Some("4G"),
+        cpu_cores: Some(2),
+        disk_size: Some("32G"),
+    };
+    let config = write_vm_config(
+        root.path(),
+        "resources",
+        "ubuntu",
+        "24.04",
+        None,
+        "amd64",
+        &image,
+        resources,
+    )
+    .unwrap();
+    let contents = fs::read_to_string(config).unwrap();
+    assert!(contents.contains("disk_size=\"32G\""));
+    assert!(contents.contains("ram=\"4G\""));
+    assert!(contents.contains("cpu_cores=\"2\""));
     assert!(
         write_vm_config(
             root.path(),
@@ -241,9 +380,36 @@ fn generated_config_is_relative_and_not_overwritten() {
             None,
             "amd64",
             &image,
+            VmResources::default(),
         )
         .is_err()
     );
+}
+
+#[test]
+fn explicit_resources_override_os_tweaks() {
+    let root = tempdir().unwrap();
+    let image = root.path().join("archlinux.iso");
+    fs::write(&image, b"test").unwrap();
+    let config = write_vm_config(
+        root.path(),
+        "archlinux",
+        "archlinux",
+        "latest",
+        None,
+        "amd64",
+        &image,
+        VmResources {
+            ram: Some("8G"),
+            cpu_cores: Some(4),
+            disk_size: Some("64G"),
+        },
+    )
+    .unwrap();
+    let vm = crate::config::load_vm(root.path(), root.path(), config).unwrap();
+    assert_eq!(vm.config.ram.as_deref(), Some("8G"));
+    assert_eq!(vm.config.cpu_cores, Some(4));
+    assert_eq!(vm.config.disk_size, "64G");
 }
 
 #[test]
@@ -271,6 +437,104 @@ fn custom_config_copies_a_local_image_without_sourcing_it() {
             .unwrap()
             .contains("guest_os=\"linux\"")
     );
+}
+
+#[test]
+fn failed_custom_config_can_be_retried() {
+    let root = tempdir().unwrap();
+    let vm_dir = root.path().join("vms");
+    let dirs = Dirs {
+        vm_dir: vm_dir.clone(),
+        state_root: root.path().join("state"),
+    };
+    let mut args = GetArgs {
+        os: Some("demo".to_string()),
+        release_or_input: Some(root.path().join("missing.iso").display().to_string()),
+        ..GetArgs::default()
+    };
+    assert!(create_custom_config(&args, &dirs, OutputFormat::Human).is_err());
+    assert!(!vm_dir.join("demo").exists());
+
+    let source = root.path().join("installer.iso");
+    fs::write(&source, b"installer").unwrap();
+    args.release_or_input = Some(source.display().to_string());
+    create_custom_config(&args, &dirs, OutputFormat::Human).unwrap();
+    assert!(vm_dir.join("demo.conf").is_file());
+}
+
+#[test]
+fn cached_xz_archive_is_unpacked_when_the_vm_is_created() {
+    if !command_exists("xz") {
+        return;
+    }
+    let root = tempdir().unwrap();
+    let source = root.path().join("installer.iso");
+    fs::write(&source, b"installer").unwrap();
+    assert!(
+        Command::new("xz")
+            .args(["-k", "-f"])
+            .arg(&source)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let archive = source.with_extension("iso.xz");
+    let vm_dir = root.path().join("vms");
+    fs::create_dir(&vm_dir).unwrap();
+    let cached = cache_image(
+        &vm_dir,
+        &ResolvedImage {
+            os: "ubuntu".to_string(),
+            release: "24.04".to_string(),
+            edition: None,
+            architecture: "amd64".to_string(),
+            url: format!("file://{}", archive.display()),
+            file_name: "installer.iso.xz".to_string(),
+            kind: ImageKind::Archive,
+            checksum: None,
+        },
+        false,
+        false,
+        false,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        cached.path.extension().and_then(|value| value.to_str()),
+        Some("xz")
+    );
+    let dirs = Dirs {
+        vm_dir: vm_dir.clone(),
+        state_root: root.path().join("state"),
+    };
+    create_cached_vm(
+        &CreateArgs {
+            name: "archive".to_string(),
+            image: cached
+                .path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            ram: None,
+            cpu_cores: None,
+            disk_size: None,
+            disk_mode: None,
+            ssh_keys: Vec::new(),
+            hostname: None,
+            network_config: None,
+        },
+        &dirs,
+        OutputFormat::Human,
+    )
+    .unwrap();
+    let vm = crate::config::load_vm(
+        &vm_dir,
+        root.path().join("state").as_path(),
+        vm_dir.join("archive.conf"),
+    )
+    .unwrap();
+    assert_eq!(fs::read(vm.config.iso.unwrap()).unwrap(), b"installer");
 }
 
 #[test]

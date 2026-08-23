@@ -7,6 +7,7 @@ executed.
 ```text
 vmctl list                         # list local VMs
 vmctl status VM                    # inspect one VM and its runtime state
+vmctl status VM --live             # query QEMU for live CPU, memory, and block details
 vmctl plan VM --output json        # inspect the exact QEMU invocation
 vmctl plan VM --output json --redact # omit sensitive inline values
 vmctl start VM                     # create missing disk/EFI state and start
@@ -41,9 +42,15 @@ vmctl get --list                    # list supported OS images
 vmctl get freebsd                   # list current FreeBSD releases and media options
 vmctl get ubuntu 24.04              # download an installer ISO into the shared cache
 vmctl create ubuntu-lab --from <cached-image>  # press Tab to complete it
+vmctl create ubuntu-lab --from <cached-image> --ram 8G --cpu-cores 4 --disk-size 64G
 vmctl get --cloud freebsd 15.1      # download a ZFS cloud QCOW2 into the shared cache
 vmctl create freebsd-01 --from <cached-image> --ssh-key ~/.ssh/id_ed25519.pub
 vmctl start freebsd-01 --wait ssh   # boot a cloud VM and wait for SSH
+vmctl start freebsd-01 --ram 2G --cpu-cores 2 # one-run resource override
+vmctl set freebsd-01 --ram 4G --cpu-cores 4 --disk-size 64G # persist resources
+vmctl set freebsd-01 --cpu-model host --cpu-pinning 0,1 --macaddr 52:54:00:12:34:56
+vmctl set freebsd-01 --port-forward 8080:80 --boot-menu on --boot-once cdrom
+vmctl set freebsd-01 --disk-cache none --disk-aio io_uring --discard unmap
 vmctl ssh freebsd-01                # uses the image's default cloud user
 ```
 
@@ -315,6 +322,12 @@ public_dir="none"
 Existing compatible configurations can be used unchanged. `vmctl` applies
 safe defaults for omitted values and reports invalid modes, ports, addresses,
 and other unsafe settings before starting QEMU.
+
+Use `ram`, `cpu_cores`, and `disk_size` in a `.conf` for persistent resource
+settings. `create` writes them with `--ram`, `--cpu-cores`, and `--disk-size`.
+`plan`, `start`, and `restart` accept `--ram` and `--cpu-cores` as one-run
+overrides. Use `vmctl set VM --ram 8G --cpu-cores 4` to persist later changes;
+restart to apply them. `vmctl set VM --disk-size 64G` resizes a stopped disk.
 
 VM runtime state is kept separate from VM data by default:
 

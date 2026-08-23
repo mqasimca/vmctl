@@ -79,6 +79,54 @@ pub enum Command {
     Status {
         #[arg(value_name = "VM", add = ArgValueCompleter::new(complete_vm_names))]
         vm: Option<String>,
+        /// Query running QEMU for live CPU, memory, and block details.
+        #[arg(long, requires = "vm")]
+        live: bool,
+    },
+
+    /// Persist VM settings; restart to apply all except stopped-disk resizing.
+    Set {
+        #[arg(value_name = "VM", add = ArgValueCompleter::new(complete_vm_names))]
+        vm: String,
+        /// Guest memory, for example 8G; takes effect after restart.
+        #[arg(long, value_name = "SIZE")]
+        ram: Option<String>,
+        /// Virtual CPU cores; takes effect after restart.
+        #[arg(long, value_name = "COUNT", value_parser = clap::value_parser!(u32).range(1..))]
+        cpu_cores: Option<u32>,
+        /// Resize the stopped VM disk and persist the resulting size.
+        #[arg(long, value_name = "SIZE")]
+        disk_size: Option<String>,
+        /// QEMU CPU model; takes effect after restart.
+        #[arg(long, value_name = "MODEL")]
+        cpu_model: Option<String>,
+        /// Pin guest CPUs to host CPU IDs; takes effect after restart.
+        #[arg(long, value_name = "CPUS")]
+        cpu_pinning: Option<String>,
+        /// Persistent guest MAC address; takes effect after restart.
+        #[arg(long, value_name = "MAC")]
+        macaddr: Option<String>,
+        /// Bridge name for bridged networking; takes effect after restart.
+        #[arg(long, value_name = "NAME")]
+        bridge: Option<String>,
+        /// Replace port forwards with HOST:GUEST pairs; use none to clear them.
+        #[arg(long = "port-forward", value_name = "HOST:GUEST")]
+        port_forwards: Vec<String>,
+        /// Set the firmware boot menu to on or off; takes effect after restart.
+        #[arg(long, value_name = "ON|OFF")]
+        boot_menu: Option<String>,
+        /// Boot once from disk, cdrom, or network; takes effect after restart.
+        #[arg(long, value_name = "DEVICE")]
+        boot_once: Option<String>,
+        /// Safe disk cache mode; takes effect after restart.
+        #[arg(long, value_name = "MODE")]
+        disk_cache: Option<String>,
+        /// Disk I/O backend; takes effect after restart.
+        #[arg(long, value_name = "MODE")]
+        disk_aio: Option<String>,
+        /// Forward guest TRIM requests: unmap or ignore; takes effect after restart.
+        #[arg(long, value_name = "MODE")]
+        discard: Option<String>,
     },
 
     /// Print the QEMU command that would be executed.
@@ -221,7 +269,7 @@ pub enum Command {
     Monitor {
         #[arg(value_name = "VM", add = ArgValueCompleter::new(complete_vm_names))]
         vm: String,
-        #[arg(value_name = "COMMAND", trailing_var_arg = true)]
+        #[arg(value_name = "COMMAND")]
         command: Vec<String>,
     },
 
@@ -372,6 +420,18 @@ pub struct CreateArgs {
     #[arg(long = "from", value_name = "IMAGE", add = ArgValueCompleter::new(complete_cached_images))]
     pub image: String,
 
+    /// Guest memory, for example 8G.
+    #[arg(long, value_name = "SIZE")]
+    pub ram: Option<String>,
+
+    /// Number of virtual CPU cores.
+    #[arg(long, value_name = "COUNT", value_parser = clap::value_parser!(u32).range(1..))]
+    pub cpu_cores: Option<u32>,
+
+    /// Initial virtual disk size, for example 64G.
+    #[arg(long, value_name = "SIZE")]
+    pub disk_size: Option<String>,
+
     /// Cloud disk layout: linked overlay (default) or full copy.
     #[arg(long, value_enum, value_name = "MODE")]
     pub disk_mode: Option<DiskMode>,
@@ -475,17 +535,26 @@ pub enum GuestAction {
         timeout: u64,
         #[arg(value_name = "PROGRAM")]
         program: String,
-        #[arg(
-            value_name = "ARG",
-            trailing_var_arg = true,
-            allow_hyphen_values = true
-        )]
+        #[arg(value_name = "ARG")]
         args: Vec<String>,
     },
 }
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct LaunchOptions {
+    /// Guest memory for this run, for example 8G.
+    #[arg(long, value_name = "SIZE", help_heading = "Resources")]
+    pub ram: Option<String>,
+
+    /// Virtual CPU cores for this run.
+    #[arg(
+        long,
+        value_name = "COUNT",
+        value_parser = clap::value_parser!(u32).range(1..),
+        help_heading = "Resources"
+    )]
+    pub cpu_cores: Option<u32>,
+
     /// Display backend: gtk, sdl, spice, spice-app, none, or cocoa on macOS.
     #[arg(long, value_name = "MODE", help_heading = "Display")]
     pub display: Option<String>,

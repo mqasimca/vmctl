@@ -23,15 +23,18 @@ pub(super) fn shortcut_vm(
         "[Desktop Entry]\nType=Application\nName={}\nComment=Start {} with vmctl\nTerminal=false\nExec={} --dir {} start {}\nPath={}\nCategories=System;Virtualization;\n",
         vm.config.name,
         vm.config.name,
-        desktop_quote(&executable),
-        desktop_quote(config_root),
-        desktop_quote(Path::new(&vm.config.name)),
+        desktop_exec_quote(&executable),
+        desktop_exec_quote(config_root),
+        desktop_exec_quote(Path::new(&vm.config.name)),
         desktop_quote(config_root),
     );
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| Error::io(parent.display(), error))?;
     }
-    fs::write(&path, content).map_err(|error| Error::io(path.display(), error))?;
+    let mut file =
+        qemu::create_truncated_file(&path).map_err(|error| Error::io(path.display(), error))?;
+    file.write_all(content.as_bytes())
+        .map_err(|error| Error::io(path.display(), error))?;
     if output == OutputFormat::Json {
         print_json_success(json!({"name": vm.config.name, "shortcut": path}));
     } else {

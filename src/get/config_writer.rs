@@ -1,5 +1,37 @@
 use super::*;
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct VmResources<'a> {
+    pub(super) ram: Option<&'a str>,
+    pub(super) cpu_cores: Option<u32>,
+    pub(super) disk_size: Option<&'a str>,
+}
+
+impl<'a> VmResources<'a> {
+    pub(super) fn from_create(args: &'a CreateArgs) -> Result<Self> {
+        if let Some(ram) = &args.ram {
+            crate::config::validate_ram_size(ram)?;
+        }
+        if args.cpu_cores == Some(0) {
+            return Err(Error::message("--cpu-cores must be greater than zero"));
+        }
+        if let Some(size) = &args.disk_size {
+            crate::qemu::validate_disk_size(size)?;
+            if size.starts_with('+') {
+                return Err(Error::message(
+                    "--disk-size must be an absolute size such as 64G; use `vmctl disk VM resize +4G` to grow an existing disk",
+                ));
+            }
+        }
+        Ok(Self {
+            ram: args.ram.as_deref(),
+            cpu_cores: args.cpu_cores,
+            disk_size: args.disk_size.as_deref(),
+        })
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn write_vm_config(
     root: &Path,
     name: &str,
@@ -8,6 +40,7 @@ pub(super) fn write_vm_config(
     edition: Option<&str>,
     architecture: &str,
     image: &Path,
+    resources: VmResources<'_>,
 ) -> Result<PathBuf> {
     let name = validate_vm_name(name)?;
     let config_path = root.join(format!("{name}.conf"));
@@ -31,11 +64,17 @@ pub(super) fn write_vm_config(
             lines.push(format!("iso=\"{}\"", config_value(&image)));
         }
     }
-    if let Some(disk_size) = disk_size {
-        lines.push(format!("disk_size=\"{disk_size}\""));
-    }
     for (key, value) in config_tweaks(os, release) {
         lines.push(format!("{key}=\"{}\"", config_value(value)));
+    }
+    if let Some(disk_size) = resources.disk_size.or(disk_size) {
+        lines.push(format!("disk_size=\"{disk_size}\""));
+    }
+    if let Some(ram) = resources.ram {
+        lines.push(format!("ram=\"{}\"", config_value(ram)));
+    }
+    if let Some(cpu_cores) = resources.cpu_cores {
+        lines.push(format!("cpu_cores=\"{cpu_cores}\""));
     }
     if guest_os == "macos" {
         lines.push(format!("macos_release=\"{}\"", config_value(release)));
@@ -61,17 +100,7 @@ pub(super) fn write_vm_config(
         lines.push("secureboot=\"off\"".to_string());
     }
     let contents = format!("{}\n", lines.join("\n"));
-    if let Some(parent) = config_path.parent() {
-        fs::create_dir_all(parent).map_err(|error| Error::io(parent.display(), error))?;
-    }
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&config_path)
-        .map_err(|error| Error::io(config_path.display(), error))?;
-    file.write_all(contents.as_bytes())
-        .map_err(|error| Error::io(config_path.display(), error))?;
-    Ok(config_path)
+    write_new_config(&config_path, &contents)
 }
 
 pub(super) struct CloudVmConfig<'a> {
@@ -88,6 +117,7 @@ pub(super) fn write_cloud_vm_config(
     root: &Path,
     name: &str,
     cloud: CloudVmConfig<'_>,
+    resources: VmResources<'_>,
 ) -> Result<PathBuf> {
     let name = validate_vm_name(name)?;
     let config_path = root.join(format!("{name}.conf"));
@@ -118,15 +148,34 @@ pub(super) fn write_cloud_vm_config(
         format!("cloud_init_iso=\"{}\"", config_value(&relative(cloud.seed))),
         format!("ssh_user=\"{}\"", config_value(cloud.ssh_user)),
     ]);
+    if let Some(disk_size) = resources.disk_size {
+        lines.push(format!("disk_size=\"{}\"", config_value(disk_size)));
+    }
+    if let Some(ram) = resources.ram {
+        lines.push(format!("ram=\"{}\"", config_value(ram)));
+    }
+    if let Some(cpu_cores) = resources.cpu_cores {
+        lines.push(format!("cpu_cores=\"{cpu_cores}\""));
+    }
     let contents = format!("{}\n", lines.join("\n"));
+    write_new_config(&config_path, &contents)
+}
+
+fn write_new_config(path: &Path, contents: &str) -> Result<PathBuf> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| Error::io(parent.display(), error))?;
+    }
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&config_path)
-        .map_err(|error| Error::io(config_path.display(), error))?;
-    file.write_all(contents.as_bytes())
-        .map_err(|error| Error::io(config_path.display(), error))?;
-    Ok(config_path)
+        .open(path)
+        .map_err(|error| Error::io(path.display(), error))?;
+    if let Err(error) = file.write_all(contents.as_bytes()) {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(Error::io(path.display(), error));
+    }
+    Ok(path.to_path_buf())
 }
 
 pub(super) fn image_kind(path: &str) -> ImageKind {
@@ -139,7 +188,7 @@ pub(super) fn image_kind(path: &str) -> ImageKind {
     {
         "qcow2" | "raw" => ImageKind::Disk,
         "img" | "dmg" => ImageKind::Img,
-        "zip" | "7z" | "gz" | "bz2" => ImageKind::Archive,
+        "zip" | "7z" | "gz" | "bz2" | "xz" => ImageKind::Archive,
         _ => ImageKind::Iso,
     }
 }
@@ -283,6 +332,7 @@ pub(super) fn validate_vm_name(name: &str) -> Result<&str> {
             character == '/'
                 || character == '\\'
                 || character.is_control()
+                || character.is_whitespace()
                 || character == '='
                 || character == ','
         })

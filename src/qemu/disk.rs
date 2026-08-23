@@ -42,6 +42,11 @@ pub fn ensure_disk(vm: &Vm) -> Result<()> {
         )));
     }
     validate_disk_size(&vm.config.disk_size)?;
+    if vm.config.disk_size.starts_with('+') {
+        return Err(Error::message(
+            "disk_size must be an absolute size such as 20G when creating a disk",
+        ));
+    }
     if let Some(parent) = vm.config.disk_img.parent() {
         fs::create_dir_all(parent).map_err(|error| Error::io(parent.display(), error))?;
     }
@@ -58,15 +63,15 @@ pub fn ensure_disk(vm: &Vm) -> Result<()> {
     if !options.is_empty() {
         command.args(["-o", options.as_str()]);
     }
-    let status = command
+    let output = command
         .args([
             vm.config.disk_img.to_string_lossy().as_ref(),
             &vm.config.disk_size,
         ])
-        .status()
+        .output()
         .map_err(|error| Error::command_unavailable("qemu-img", error))?;
-    if !status.success() {
-        return Err(Error::command_failed("qemu-img create"));
+    if !output.status.success() {
+        return Err(qemu_img_failure("create", output));
     }
     Ok(())
 }
@@ -94,14 +99,14 @@ pub(crate) fn create_cloud_overlay(base: &Path, overlay: &Path, backing: &str) -
             temporary.display()
         )));
     }
-    let status = Command::new("qemu-img")
+    let output = Command::new("qemu-img")
         .args(["create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", backing])
         .arg(&temporary)
-        .status()
+        .output()
         .map_err(|error| Error::command_unavailable("qemu-img", error))?;
-    if !status.success() {
+    if !output.status.success() {
         let _ = fs::remove_file(&temporary);
-        return Err(Error::command_failed_status("qemu-img create", status));
+        return Err(qemu_img_failure("create", output));
     }
     if let Err(error) = fs::rename(&temporary, overlay) {
         let _ = fs::remove_file(&temporary);
@@ -125,15 +130,15 @@ pub(crate) fn create_cloud_copy(base: &Path, disk: &Path) -> Result<()> {
             temporary.display()
         )));
     }
-    let status = Command::new("qemu-img")
+    let output = Command::new("qemu-img")
         .args(["convert", "-q", "-f", "qcow2", "-O", "qcow2"])
         .arg(base)
         .arg(&temporary)
-        .status()
+        .output()
         .map_err(|error| Error::command_unavailable("qemu-img", error))?;
-    if !status.success() {
+    if !output.status.success() {
         let _ = fs::remove_file(&temporary);
-        return Err(Error::command_failed_status("qemu-img convert", status));
+        return Err(qemu_img_failure("convert", output));
     }
     if let Err(error) = fs::rename(&temporary, disk) {
         let _ = fs::remove_file(&temporary);
@@ -247,6 +252,9 @@ pub(crate) fn disk_convert(
 
 pub(crate) fn disk_compact(path: &Path) -> Result<Value> {
     require_disk_file(path)?;
+    let permissions = fs::metadata(path)
+        .map_err(|error| Error::io(path.display(), error))?
+        .permissions();
     let info = disk_info(path)?;
     let format = info
         .get("format")
@@ -261,7 +269,7 @@ pub(crate) fn disk_compact(path: &Path) -> Result<Value> {
         ".{file_name}.vmctl-compact-{}.tmp",
         std::process::id()
     ));
-    if temporary.exists() {
+    if fs::symlink_metadata(&temporary).is_ok() {
         return Err(Error::message(format!(
             "temporary compacted disk already exists: {}",
             temporary.display()
@@ -285,7 +293,11 @@ pub(crate) fn disk_compact(path: &Path) -> Result<Value> {
         let _ = fs::remove_file(&temporary);
         return Err(qemu_img_failure("compact", output));
     }
-    if let Err(error) = replace_runtime_file(&temporary, path) {
+    if let Err(error) = fs::set_permissions(&temporary, permissions) {
+        let _ = fs::remove_file(&temporary);
+        return Err(Error::io(temporary.display(), error));
+    }
+    if let Err(error) = replace_file(&temporary, path) {
         let _ = fs::remove_file(&temporary);
         return Err(error);
     }
@@ -318,15 +330,9 @@ pub(super) fn require_disk_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn validate_disk_size(size: &str) -> Result<()> {
-    if size.is_empty()
-        || size.starts_with('-')
-        || size.chars().any(|character| {
-            character.is_ascii_control()
-                || character.is_ascii_whitespace()
-                || !(character.is_ascii_alphanumeric() || ".+".contains(character))
-        })
-    {
+pub(crate) fn validate_disk_size(size: &str) -> Result<()> {
+    let value = size.strip_prefix('+').unwrap_or(size);
+    if size.starts_with('-') || crate::config::validate_ram_size(value).is_err() {
         return Err(Error::message(format!(
             "invalid disk size '{size}'; use a value such as 20G or +4G"
         )));

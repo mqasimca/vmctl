@@ -191,15 +191,8 @@ pub(crate) fn process_matches_checked(pid: i32, name: &str) -> Result<bool> {
         if name.is_empty() {
             return Ok(true);
         }
-        let expected = format!("{name},process={name}");
-        let arguments: Vec<&str> = fields
-            .iter()
-            .filter_map(|field| std::str::from_utf8(field).ok())
-            .collect();
         let command = String::from_utf8_lossy(&command_line);
-        Ok(arguments
-            .iter()
-            .any(|value| value.starts_with(&expected) || *value == format!("process={name}"))
+        Ok(command_line_has_process_name(&command, name)
             || command_line_has_vm_name(&command, name))
     }
 
@@ -221,10 +214,9 @@ pub(crate) fn process_matches_checked(pid: i32, name: &str) -> Result<bool> {
                 return Ok(false);
             }
             let qemu = command_line.to_ascii_lowercase().contains("qemu-system-");
-            let expected = format!("process={name}");
             return Ok(qemu
                 && (name.is_empty()
-                    || command_line.contains(&expected)
+                    || command_line_has_process_name(&command_line, name)
                     || command_line_has_vm_name(&command_line, name)));
         }
 
@@ -262,12 +254,25 @@ pub(crate) fn process_matches_checked(pid: i32, name: &str) -> Result<bool> {
             return Ok(false);
         }
         let command = String::from_utf8_lossy(&output.stdout);
-        let expected = format!("process={name}");
         Ok(command.contains("qemu-system-")
             && (name.is_empty()
-                || command.contains(&expected)
+                || command_line_has_process_name(&command, name)
                 || command_line_has_vm_name(&command, name)))
     }
+}
+
+pub(super) fn process_name_argument_matches(value: &str, name: &str) -> bool {
+    let expected = format!("process={name}");
+    value
+        .trim_matches(['\'', '"'])
+        .split(',')
+        .any(|option| option == expected)
+}
+
+pub(super) fn command_line_has_process_name(command: &str, name: &str) -> bool {
+    command
+        .split(|character: char| character.is_whitespace() || character == '\0')
+        .any(|argument| process_name_argument_matches(argument, name))
 }
 
 pub(super) fn command_line_has_vm_name(command: &str, name: &str) -> bool {
@@ -275,7 +280,19 @@ pub(super) fn command_line_has_vm_name(command: &str, name: &str) -> bool {
         .split_whitespace()
         .collect::<Vec<_>>()
         .windows(2)
-        .any(|pair| pair == ["-name", name])
+        .any(|pair| {
+            if pair[0].trim_matches(['\'', '"']) != "-name" {
+                return false;
+            }
+            let value = pair[1].trim_matches(['\'', '"']);
+            let mut options = value.split(',');
+            if options.next() != Some(name) {
+                return false;
+            }
+            options
+                .find_map(|option| option.strip_prefix("process="))
+                .is_none_or(|process_name| process_name == name)
+        })
 }
 
 #[cfg(target_os = "linux")]

@@ -279,6 +279,7 @@ pub(super) fn create_cached_cloud_vm(
     source: CachedSource,
     output: OutputFormat,
 ) -> Result<()> {
+    let resources = VmResources::from_create(args)?;
     if args.ssh_keys.is_empty() {
         return Err(Error::invalid_argument(
             "--ssh-key",
@@ -297,46 +298,59 @@ pub(super) fn create_cached_cloud_vm(
             config_path.display()
         )));
     }
-    fs::create_dir_all(root).map_err(|error| Error::io(root.display(), error))?;
-    fs::create_dir(&target_dir).map_err(|error| Error::io(target_dir.display(), error))?;
-    let seed = create_cloud_seed(
-        &target_dir,
-        &source.os,
-        hostname,
-        &args.ssh_keys,
-        args.network_config.as_deref(),
-    )?;
-    let disk = target_dir.join("disk.qcow2");
-    let disk_mode = args.disk_mode.unwrap_or(DiskMode::Linked);
-    if disk_mode == DiskMode::Linked {
-        let backing = format!(
-            "../.cache/objects/{}",
-            source
-                .path
-                .file_name()
-                .and_then(|value| value.to_str())
-                .ok_or_else(|| { Error::message("cached cloud image has no valid file name") })?
-        );
-        crate::qemu::create_cloud_overlay(&source.path, &disk, &backing)?;
-    } else {
-        crate::qemu::create_cloud_copy(&source.path, &disk)?;
-    }
     let ssh_user = source.ssh_user.as_deref().ok_or_else(|| {
         Error::message("cached cloud image lacks an SSH user; run `vmctl get --refresh-cache`")
     })?;
-    let config = write_cloud_vm_config(
-        root,
-        name,
-        CloudVmConfig {
-            os: &source.os,
-            release: &source.release,
-            architecture: &source.architecture,
-            base: (disk_mode == DiskMode::Linked).then_some(source.path.as_path()),
-            disk: &disk,
-            seed: &seed,
-            ssh_user,
-        },
-    )?;
+    fs::create_dir_all(root).map_err(|error| Error::io(root.display(), error))?;
+    fs::create_dir(&target_dir).map_err(|error| Error::io(target_dir.display(), error))?;
+    let disk = target_dir.join("disk.qcow2");
+    let disk_mode = args.disk_mode.unwrap_or(DiskMode::Linked);
+    let provision = (|| {
+        let seed = create_cloud_seed(
+            &target_dir,
+            &source.os,
+            hostname,
+            &args.ssh_keys,
+            args.network_config.as_deref(),
+        )?;
+        if disk_mode == DiskMode::Linked {
+            let backing = format!(
+                "../.cache/objects/{}",
+                source
+                    .path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .ok_or_else(|| {
+                        Error::message("cached cloud image has no valid file name")
+                    })?
+            );
+            crate::qemu::create_cloud_overlay(&source.path, &disk, &backing)?;
+        } else {
+            crate::qemu::create_cloud_copy(&source.path, &disk)?;
+        }
+        crate::qemu::disk_resize(&disk, resources.disk_size.unwrap_or("16G"), false)?;
+        write_cloud_vm_config(
+            root,
+            name,
+            CloudVmConfig {
+                os: &source.os,
+                release: &source.release,
+                architecture: &source.architecture,
+                base: (disk_mode == DiskMode::Linked).then_some(source.path.as_path()),
+                disk: &disk,
+                seed: &seed,
+                ssh_user,
+            },
+            resources,
+        )
+    })();
+    let config = match provision {
+        Ok(config) => config,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&target_dir);
+            return Err(error);
+        }
+    };
     let result = json!({
         "name": name,
         "image": source.path,
@@ -494,6 +508,7 @@ fn validate_hostname(hostname: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn reads_checksum_manifest_assets() {
@@ -553,5 +568,89 @@ mod tests {
         assert!(url.ends_with(&file_name));
         assert!(file_name.ends_with("BASIC-CLOUDINIT-zfs.qcow2.xz"));
         assert_eq!(checksum, format!("sha256:{}", "a".repeat(64)));
+    }
+
+    #[test]
+    fn cloud_create_resizes_the_default_disk_and_cleans_up_a_failed_attempt() {
+        if !command_exists("qemu-img")
+            || !["mkisofs", "genisoimage", "xorriso"]
+                .into_iter()
+                .any(command_exists)
+        {
+            return;
+        }
+        let root = tempdir().unwrap();
+        let vm_dir = root.path().join("vms");
+        let objects = vm_dir.join(".cache/objects");
+        fs::create_dir_all(&objects).unwrap();
+        let base = objects.join("base.qcow2");
+        assert!(
+            Command::new("qemu-img")
+                .args(["create", "-q", "-f", "qcow2"])
+                .arg(&base)
+                .arg("8M")
+                .status()
+                .unwrap()
+                .success()
+        );
+        let key = root.path().join("id.pub");
+        fs::write(&key, "ssh-ed25519 test\n").unwrap();
+        let dirs = Dirs {
+            vm_dir: vm_dir.clone(),
+            state_root: root.path().join("state"),
+        };
+        let source = CachedSource {
+            path: base,
+            os: "ubuntu".to_string(),
+            release: "24.04".to_string(),
+            edition: None,
+            architecture: "amd64".to_string(),
+            kind: ImageKind::Disk,
+            cloud: true,
+            ssh_user: Some("ubuntu".to_string()),
+        };
+        let mut args = CreateArgs {
+            name: "cloud".to_string(),
+            image: "base.qcow2".to_string(),
+            ram: None,
+            cpu_cores: None,
+            disk_size: Some("1M".to_string()),
+            disk_mode: None,
+            ssh_keys: vec![key],
+            hostname: None,
+            network_config: None,
+        };
+        let error =
+            create_cached_cloud_vm(&args, &dirs, source.clone(), OutputFormat::Human).unwrap_err();
+        assert!(error.to_string().contains("qemu-img resize"));
+        assert!(!vm_dir.join("cloud").exists());
+        assert!(!vm_dir.join("cloud.conf").exists());
+
+        args.disk_size = None;
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("missing.conf", vm_dir.join("cloud.conf")).unwrap();
+            assert!(
+                create_cached_cloud_vm(&args, &dirs, source.clone(), OutputFormat::Human).is_err()
+            );
+            assert!(!vm_dir.join("cloud").exists());
+            assert!(
+                fs::symlink_metadata(vm_dir.join("cloud.conf"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            fs::remove_file(vm_dir.join("cloud.conf")).unwrap();
+        }
+        create_cached_cloud_vm(&args, &dirs, source, OutputFormat::Human).unwrap();
+        let disk = crate::qemu::disk_info(&vm_dir.join("cloud/disk.qcow2")).unwrap();
+        assert_eq!(disk["virtual-size"], 16 * 1024_u64.pow(3));
+        let vm = crate::config::load_vm(
+            &vm_dir,
+            root.path().join("state").as_path(),
+            vm_dir.join("cloud.conf"),
+        )
+        .unwrap();
+        assert_eq!(vm.config.disk_size, "16G");
     }
 }

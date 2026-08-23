@@ -7,7 +7,15 @@ pub(super) fn load_effective_vm(dirs: &Dirs, name: &str, options: &LaunchOptions
 }
 
 pub(super) fn apply_launch_options(vm: &mut Vm, options: &LaunchOptions) -> Result<()> {
+    reject_consumed_global_flags(&options.viewer_extra_args)?;
+    reject_consumed_global_flags(&options.extra_args)?;
     let config = &mut vm.config;
+    if let Some(value) = &options.ram {
+        config.ram = Some(value.clone());
+    }
+    if let Some(value) = options.cpu_cores {
+        config.cpu_cores = Some(value);
+    }
     if let Some(value) = &options.display {
         config.display = value.to_ascii_lowercase();
     }
@@ -99,4 +107,23 @@ pub(super) fn apply_launch_options(vm: &mut Vm, options: &LaunchOptions) -> Resu
     }
     config.extra_args.extend(options.extra_args.clone());
     config.validate()
+}
+
+fn reject_consumed_global_flags(arguments: &[String]) -> Result<()> {
+    if arguments.iter().any(|argument| {
+        let flag = argument
+            .split_once('=')
+            .map_or(argument.as_str(), |(flag, _)| flag);
+        matches!(
+            flag,
+            "--dir" | "--vm-dir" | "--state-dir" | "--output" | "--verbose" | "-d"
+        ) || flag
+            .strip_prefix('-')
+            .is_some_and(|flag| !flag.is_empty() && flag.chars().all(|character| character == 'v'))
+    }) {
+        return Err(Error::message(
+            "place vmctl global options before --extra-args or --viewer-extra-args",
+        ));
+    }
+    Ok(())
 }

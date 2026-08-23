@@ -69,12 +69,18 @@ pub(super) fn vm_summary(vm: &Vm) -> Result<Value> {
         VmState::Running(pid) => ("running", Some(pid)),
         VmState::Stopped => ("stopped", None),
     };
+    let ssh_host = if state == "running" {
+        runtime_ssh_host(vm)?
+    } else {
+        None
+    };
     Ok(json!({
         "name": vm.config.name,
         "state": state,
         "pid": pid,
         "config": vm.config.config_path,
         "ssh_port": effective_ssh_port(vm)?,
+        "ssh_host": ssh_host,
         "guest_os": vm.config.guest_os,
         "arch": vm.config.arch,
         "ssh_access": vm.config.ssh_access,
@@ -82,9 +88,9 @@ pub(super) fn vm_summary(vm: &Vm) -> Result<Value> {
     }))
 }
 
-pub(super) fn vm_status(vm: &Vm) -> Result<Value> {
+pub(super) fn vm_status(vm: &Vm, live: bool) -> Result<Value> {
     let summary = vm_summary(vm)?;
-    let ipc = ipc_report(&vm.paths)?;
+    let ipc = ipc_report(&vm.paths, vm.config.guest_agent)?;
     let qmp_status = if summary["state"] == "running" {
         match qmp_status(&vm.paths) {
             Ok(status) => json!({"reachable": true, "status": status}),
@@ -97,6 +103,14 @@ pub(super) fn vm_status(vm: &Vm) -> Result<Value> {
     } else {
         json!({"reachable": false, "status": "stopped"})
     };
+    let live_resources = if live && summary["state"] == "running" {
+        match qmp_live_resources(&vm.paths) {
+            Ok(resources) => json!({"reachable": true, "resources": resources}),
+            Err(error) => json!({"reachable": false, "error": error.to_string()}),
+        }
+    } else {
+        Value::Null
+    };
     Ok(json!({
         "name": vm.config.name,
         "state": summary["state"].clone(),
@@ -108,12 +122,16 @@ pub(super) fn vm_status(vm: &Vm) -> Result<Value> {
         "display": vm.config.display,
         "disk": vm.config.disk_img,
         "disk_size": vm.config.disk_size,
+        "configured_ram": vm.config.ram,
+        "configured_cpu_cores": vm.config.cpu_cores,
         "boot": vm.config.boot,
         "ssh_port": summary["ssh_port"].clone(),
+        "ssh_host": summary["ssh_host"].clone(),
         "ssh_access": vm.config.ssh_access,
         "ssh_user": vm.config.ssh_user,
         "ipc": ipc,
         "qmp_status": qmp_status,
+        "live_resources": live_resources,
         "monitor": vm.paths.monitor_socket(),
         "serial": vm.paths.serial_socket(),
     }))
@@ -126,8 +144,8 @@ pub(super) fn state_label(vm: &Vm) -> Result<String> {
     })
 }
 
-pub(super) fn print_vm_status(vm: &Vm) -> Result<()> {
-    let ipc = ipc_report(&vm.paths)?;
+pub(super) fn print_vm_status(vm: &Vm, live: bool) -> Result<()> {
+    let ipc = ipc_report(&vm.paths, vm.config.guest_agent)?;
     let guest_agent = if ipc["guest_agent"].is_null() {
         "disabled".to_string()
     } else {
@@ -142,11 +160,26 @@ pub(super) fn print_vm_status(vm: &Vm) -> Result<()> {
     println!("display:     {}", vm.config.display);
     println!("disk:        {}", vm.config.disk_img.display());
     println!("disk size:   {}", vm.config.disk_size);
+    println!(
+        "configured ram: {}",
+        vm.config.ram.as_deref().unwrap_or("host default")
+    );
+    println!(
+        "configured cpu cores: {}",
+        vm.config
+            .cpu_cores
+            .map_or_else(|| "host default".to_string(), |cores| cores.to_string())
+    );
     println!("boot:        {}", vm.config.boot);
     println!(
         "ssh port:    {}",
         effective_ssh_port(vm)?.map_or_else(|| "auto".to_string(), |port| port.to_string())
     );
+    if matches!(vm.state()?, VmState::Running(_))
+        && let Some(host) = runtime_ssh_host(vm)?
+    {
+        println!("ssh host:    {host}");
+    }
     if let Some(user) = &vm.config.ssh_user {
         println!("ssh user:    {user}");
     }
@@ -160,6 +193,18 @@ pub(super) fn print_vm_status(vm: &Vm) -> Result<()> {
     println!("guest agent: {guest_agent}");
     println!("serial:      {}", vm.paths.serial_socket().display());
     println!("runtime:     {}", vm.paths.state_dir.display());
+    if live && matches!(vm.state()?, VmState::Running(_)) {
+        match qmp_live_resources(&vm.paths) {
+            Ok(resources) => {
+                println!(
+                    "live vcpus: {}",
+                    resources["cpus"].as_array().map_or(0, Vec::len)
+                );
+                println!("live memory: {}", resources["memory"]);
+            }
+            Err(error) => println!("live resources: unavailable ({error})"),
+        }
+    }
     Ok(())
 }
 

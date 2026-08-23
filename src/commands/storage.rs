@@ -1,5 +1,271 @@
 use super::*;
 
+#[allow(clippy::too_many_arguments)] // Mirrors the one-to-one `vmctl set` CLI options.
+pub(super) fn set_vm(
+    dirs: &Dirs,
+    name: &str,
+    ram: Option<&str>,
+    cpu_cores: Option<u32>,
+    disk_size: Option<&str>,
+    cpu_model: Option<&str>,
+    cpu_pinning: Option<&str>,
+    macaddr: Option<&str>,
+    bridge: Option<&str>,
+    port_forwards: &[String],
+    boot_menu: Option<&str>,
+    boot_once: Option<&str>,
+    disk_cache: Option<&str>,
+    disk_aio: Option<&str>,
+    discard: Option<&str>,
+    output: OutputFormat,
+) -> Result<()> {
+    if ram.is_none()
+        && cpu_cores.is_none()
+        && disk_size.is_none()
+        && cpu_model.is_none()
+        && cpu_pinning.is_none()
+        && macaddr.is_none()
+        && bridge.is_none()
+        && port_forwards.is_empty()
+        && boot_menu.is_none()
+        && boot_once.is_none()
+        && disk_cache.is_none()
+        && disk_aio.is_none()
+        && discard.is_none()
+    {
+        return Err(Error::invalid_argument(
+            "VM settings",
+            "provide at least one setting option",
+        ));
+    }
+    if let Some(ram) = ram {
+        crate::config::validate_ram_size(ram)?;
+    }
+    if let Some(size) = disk_size {
+        crate::qemu::validate_disk_size(size)?;
+        if size.starts_with('+') {
+            return Err(Error::message(
+                "--disk-size must be an absolute size such as 64G; use `vmctl disk VM resize +4G` to grow an existing disk",
+            ));
+        }
+    }
+
+    if let Some(pinning) = cpu_pinning {
+        validate_cpu_pinning(pinning)?;
+    }
+    let vm = find(&dirs.vm_dir, &dirs.state_root, name)?;
+    let _operation_lock = acquire_vm_lock(&vm.paths)?;
+    let mut updated = vm.config.clone();
+    if let Some(ram) = ram {
+        updated.ram = Some(ram.to_string());
+    }
+    if let Some(cpu_cores) = cpu_cores {
+        updated.cpu_cores = Some(cpu_cores);
+    }
+    if let Some(disk_size) = disk_size {
+        updated.disk_size = disk_size.to_string();
+    }
+    if let Some(cpu_model) = cpu_model {
+        updated.cpu_model = Some(cpu_model.to_string());
+    }
+    if let Some(cpu_pinning) = cpu_pinning {
+        updated.cpu_pinning = Some(cpu_pinning.to_string());
+    }
+    if let Some(macaddr) = macaddr {
+        updated.macaddr = Some(macaddr.to_string());
+    }
+    if let Some(bridge) = bridge {
+        updated.bridge = (!bridge.eq_ignore_ascii_case("none")).then(|| bridge.to_string());
+    }
+    if !port_forwards.is_empty() {
+        updated.port_forwards = parse_port_forwards(port_forwards)?;
+    }
+    if let Some(boot_menu) = boot_menu {
+        updated.boot_menu = parse_on_off(boot_menu, "boot menu")?;
+    }
+    if let Some(boot_once) = boot_once {
+        updated.boot_once =
+            (!boot_once.eq_ignore_ascii_case("none")).then(|| boot_once.to_ascii_lowercase());
+    }
+    if let Some(disk_cache) = disk_cache {
+        updated.disk_cache = disk_cache.to_ascii_lowercase();
+    }
+    if let Some(disk_aio) = disk_aio {
+        updated.disk_aio = disk_aio.to_ascii_lowercase();
+    }
+    if let Some(discard) = discard {
+        updated.discard = discard.to_ascii_lowercase();
+    }
+    updated.validate()?;
+    if (cpu_cores.is_some() || cpu_pinning.is_some())
+        && let Some(pinning) = &updated.cpu_pinning
+    {
+        let cores = updated.cpu_cores.unwrap_or_else(qemu::default_cpu_cores);
+        validate_cpu_pinning_for_host(pinning, env::consts::OS, cores)?;
+    }
+    let mut updates = Vec::new();
+    if let Some(ram) = ram {
+        updates.push(("ram", ram.to_string()));
+    }
+    if let Some(cpu_cores) = cpu_cores {
+        updates.push(("cpu_cores", cpu_cores.to_string()));
+    }
+    if let Some(disk_size) = disk_size {
+        updates.push(("disk_size", disk_size.to_string()));
+    }
+    if let Some(cpu_model) = cpu_model {
+        updates.push(("cpu_model", cpu_model.to_string()));
+    }
+    if let Some(cpu_pinning) = cpu_pinning {
+        updates.push(("cpu_pinning", cpu_pinning.to_string()));
+    }
+    if let Some(macaddr) = macaddr {
+        updates.push(("macaddr", macaddr.to_string()));
+    }
+    if let Some(bridge) = bridge {
+        updates.push((
+            "bridge",
+            if !bridge.eq_ignore_ascii_case("none") {
+                bridge.to_string()
+            } else {
+                String::new()
+            },
+        ));
+    }
+    if !port_forwards.is_empty() {
+        updates.push((
+            "port_forwards",
+            format!(
+                "({})",
+                updated
+                    .port_forwards
+                    .iter()
+                    .map(|(host, guest)| format!("{host}:{guest}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+        ));
+    }
+    if let Some(boot_menu) = boot_menu {
+        updates.push(("boot_menu", boot_menu.to_ascii_lowercase()));
+    }
+    if let Some(boot_once) = boot_once {
+        updates.push((
+            "boot_once",
+            if !boot_once.eq_ignore_ascii_case("none") {
+                boot_once.to_ascii_lowercase()
+            } else {
+                String::new()
+            },
+        ));
+    }
+    if let Some(disk_cache) = disk_cache {
+        updates.push(("disk_cache", disk_cache.to_ascii_lowercase()));
+    }
+    if let Some(disk_aio) = disk_aio {
+        updates.push(("disk_aio", disk_aio.to_ascii_lowercase()));
+    }
+    if let Some(discard) = discard {
+        updates.push(("discard", discard.to_ascii_lowercase()));
+    }
+    let (mut config_file, settings) = prepare_config_settings(&vm.config.config_path, &updates)?;
+    if let Some(size) = disk_size {
+        require_stopped_disk(&vm, "resize")?;
+        disk_resize(&vm.config.disk_img, size, false)?;
+    }
+    config_file
+        .write_all(&settings)
+        .map_err(|error| Error::io(vm.config.config_path.display(), error))?;
+
+    let restart_required = updates.iter().any(|(key, _)| *key != "disk_size");
+    if output == OutputFormat::Json {
+        print_json_success(json!({
+            "name": vm.config.name,
+            "ram": ram,
+            "cpu_cores": cpu_cores,
+            "disk_size": disk_size,
+            "cpu_model": cpu_model,
+            "cpu_pinning": cpu_pinning,
+            "macaddr": macaddr,
+            "bridge": bridge,
+            "port_forwards": port_forwards,
+            "boot_menu": boot_menu,
+            "boot_once": boot_once,
+            "disk_cache": disk_cache,
+            "disk_aio": disk_aio,
+            "discard": discard,
+            "restart_required": restart_required,
+        }));
+    } else {
+        println!("Updated settings for {}", vm.config.name);
+        if restart_required {
+            println!("Restart the VM to apply setting changes");
+        }
+    }
+    Ok(())
+}
+
+fn parse_on_off(value: &str, setting: &str) -> Result<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        _ => Err(Error::message(format!("{setting} must be on or off"))),
+    }
+}
+
+fn parse_port_forwards(values: &[String]) -> Result<Vec<(u16, u16)>> {
+    if values.len() == 1 && values[0].eq_ignore_ascii_case("none") {
+        return Ok(Vec::new());
+    }
+    values
+        .iter()
+        .map(|value| {
+            if value.eq_ignore_ascii_case("none") {
+                return Err(Error::message(
+                    "--port-forward none cannot be combined with port pairs",
+                ));
+            }
+            let (host, guest) = value
+                .split_once(':')
+                .ok_or_else(|| Error::message(format!("invalid port forward '{value}'")))?;
+            let host = host
+                .parse::<u16>()
+                .ok()
+                .filter(|port| *port != 0)
+                .ok_or_else(|| Error::message(format!("invalid host port in '{value}'")))?;
+            let guest = guest
+                .parse::<u16>()
+                .ok()
+                .filter(|port| *port != 0)
+                .ok_or_else(|| Error::message(format!("invalid guest port in '{value}'")))?;
+            Ok((host, guest))
+        })
+        .collect()
+}
+
+fn prepare_config_settings(path: &Path, updates: &[(&str, String)]) -> Result<(File, Vec<u8>)> {
+    let mut settings = String::new();
+    for (key, value) in updates {
+        if value.contains(['\n', '\r']) {
+            return Err(Error::invalid_argument(
+                "VM setting",
+                "values cannot contain newlines",
+            ));
+        }
+        let value = value.replace('\\', "\\\\").replace('"', "\\\"");
+        settings.push_str(&format!("{key}=\"{value}\"\n"));
+    }
+    let mut file = crate::config::open_config_for_append(path)?;
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents)
+        .map_err(|error| Error::io(path.display(), error))?;
+    let mut settings = settings.into_bytes();
+    if !contents.is_empty() && !contents.ends_with(b"\n") {
+        settings.insert(0, b'\n');
+    }
+    Ok((file, settings))
+}
+
 pub(super) fn snapshot_vm(
     dirs: &Dirs,
     name: &str,
@@ -216,7 +482,7 @@ pub(super) fn delete_disk(dirs: &Dirs, name: &str, yes: bool, output: OutputForm
 
 pub(super) fn delete_vm(dirs: &Dirs, name: &str, yes: bool, output: OutputFormat) -> Result<()> {
     let vm = find(&dirs.vm_dir, &dirs.state_root, name)?;
-    let _operation_lock = acquire_vm_lock(&vm.paths)?;
+    let operation_lock = acquire_vm_lock(&vm.paths)?;
     ensure_delete_allowed(&vm, yes)?;
     let data_dir = vm
         .config
@@ -238,6 +504,7 @@ pub(super) fn delete_vm(dirs: &Dirs, name: &str, yes: bool, output: OutputFormat
         fs::remove_dir_all(&data_dir).map_err(|error| Error::io(data_dir.display(), error))?;
     }
     remove_if_present(&vm.config.config_path)?;
+    drop(operation_lock);
     if vm.paths.state_dir.is_dir() {
         fs::remove_dir_all(&vm.paths.state_dir)
             .map_err(|error| Error::io(vm.paths.state_dir.display(), error))?;

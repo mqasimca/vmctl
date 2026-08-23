@@ -3,7 +3,7 @@ use std::cell::Cell;
 use std::env;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 #[cfg(unix)]
@@ -11,7 +11,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 #[cfg(windows)]
-use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
@@ -60,7 +60,6 @@ use process::*;
 mod qmp;
 use qmp::*;
 mod runtime;
-use runtime::*;
 mod shell;
 mod storage;
 use storage::*;
@@ -69,18 +68,18 @@ pub(crate) use capabilities::{qemu_capability_report, virtiofsd_available};
 pub(crate) use devices::{configured_bridge, virtiofs_requested};
 pub(crate) use disk::{
     create_cloud_copy, create_cloud_overlay, disk_check, disk_compact, disk_convert, disk_info,
-    disk_resize, ensure_disk,
+    disk_resize, ensure_disk, validate_disk_size,
 };
 pub(crate) use guest::{disk_snapshot, guest_command, guest_exec, guest_shutdown};
-pub(crate) use host::render_node;
+pub(crate) use host::{default_cpu_cores, render_node};
 pub(crate) use monitor::send_monitor_command;
 pub(crate) use network::spice_address;
 pub(crate) use plan::build_plan;
 pub(crate) use qmp::{process_identity, process_matches_checked_with_identity};
 pub(crate) use runtime::{
-    ensure_ipc_endpoints_available, ipc_report, kill_process, qmp_ping, qmp_status,
-    remove_runtime_sockets, shutdown_via_qmp, start_tpm, start_virtiofsd, stop_tpm, stop_virtiofsd,
-    wait_for_exit, write_runtime_files,
+    ensure_ipc_endpoints_available, ipc_report, kill_process, qmp_live_resources, qmp_ping,
+    qmp_status, remove_runtime_sockets, replace_file, shutdown_via_qmp, start_tpm, start_virtiofsd,
+    stop_tpm, stop_virtiofsd, wait_for_exit, write_atomic_file, write_runtime_files,
 };
 pub(crate) use shell::shell_join;
 
@@ -167,28 +166,7 @@ impl QemuPlanContext {
                 ));
             }
         }
-        let ssh_port = if uses_port_forwarding_network(config) {
-            Some(match config.ssh_port {
-                Some(port) => port,
-                None => find_free_port(22220)?,
-            })
-        } else {
-            None
-        };
-        let spice_port = match config.display.as_str() {
-            "none" => Some(match config.spice_port {
-                Some(port) => port,
-                None => find_free_port(5930)?,
-            }),
-            "spice" if config.access != "local" || host_os == "windows" => {
-                Some(match config.spice_port {
-                    Some(port) => port,
-                    None => find_free_port(5930)?,
-                })
-            }
-            "spice" | "spice-app" => config.spice_port,
-            _ => None,
-        };
+        let (ssh_port, spice_port) = listener_ports(config, &host_os)?;
 
         let audio_driver = detect_audio_driver(&host_os);
         let virtiofsd = if host_os == "linux" {
@@ -236,6 +214,69 @@ impl QemuPlanContext {
     }
 }
 
+fn listener_ports(config: &VmConfig, host_os: &str) -> Result<(Option<u16>, Option<u16>)> {
+    let uses_port_forwarding = uses_port_forwarding_network(config);
+    let mut reserved = if uses_port_forwarding {
+        config.port_forwards.iter().map(|(host, _)| *host).collect()
+    } else {
+        Vec::new()
+    };
+    for (mode, port, service) in [
+        (
+            &config.monitor,
+            config.monitor_telnet_port,
+            "monitor Telnet",
+        ),
+        (&config.serial, config.serial_telnet_port, "serial Telnet"),
+    ] {
+        if mode == "telnet" {
+            reserve_listener_port(&mut reserved, port, service)?;
+        }
+    }
+    let ssh = if uses_port_forwarding {
+        let port = config
+            .ssh_port
+            .map_or_else(|| find_free_port(22220, &reserved), Ok)?;
+        reserve_listener_port(&mut reserved, port, "SSH")?;
+        Some(port)
+    } else {
+        None
+    };
+    let spice = match config.display.as_str() {
+        "none" => Some(
+            config
+                .spice_port
+                .map_or_else(|| find_free_port(5930, &reserved), Ok)?,
+        ),
+        "spice" | "spice-app" if host_os == "windows" => Some(
+            config
+                .spice_port
+                .map_or_else(|| find_free_port(5930, &reserved), Ok)?,
+        ),
+        "spice" if config.access != "local" => Some(
+            config
+                .spice_port
+                .map_or_else(|| find_free_port(5930, &reserved), Ok)?,
+        ),
+        "spice" | "spice-app" => config.spice_port,
+        _ => None,
+    };
+    if let Some(port) = spice {
+        reserve_listener_port(&mut reserved, port, "SPICE")?;
+    }
+    Ok((ssh, spice))
+}
+
+fn reserve_listener_port(ports: &mut Vec<u16>, port: u16, service: &str) -> Result<()> {
+    if ports.contains(&port) {
+        return Err(Error::message(format!(
+            "{service} port {port} conflicts with another configured listener"
+        )));
+    }
+    ports.push(port);
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QemuPlan {
     pub binary: String,
@@ -248,22 +289,61 @@ pub struct QemuPlan {
     pub spice_host: Option<String>,
     pub monitor_telnet: Option<(String, u16)>,
     pub serial_telnet: Option<(String, u16)>,
+    pub forwarded_ports: Vec<(String, u16)>,
 }
 
 #[derive(Debug)]
-pub(crate) struct VmOperationLock {
+pub(crate) struct FileLock {
     file: File,
 }
 
-impl Drop for VmOperationLock {
+impl Drop for FileLock {
     fn drop(&mut self) {
-        unlock_operation_file(&self.file);
+        unlock_file(&self.file);
     }
 }
 
-pub(crate) fn acquire_vm_lock(paths: &VmPaths) -> Result<VmOperationLock> {
-    fs::create_dir_all(&paths.state_dir)
-        .map_err(|error| Error::io(paths.state_dir.display(), error))?;
+pub(crate) fn acquire_file_lock(path: &Path) -> io::Result<FileLock> {
+    let file = open_lock_file(path)?;
+    try_lock_file(&file)?;
+    Ok(FileLock { file })
+}
+
+fn ensure_state_directory(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if unsafe_file_metadata(&metadata) => {
+            return Err(Error::message(format!(
+                "refusing to use state directory symlink {}",
+                path.display()
+            )));
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(Error::message(format!(
+                "state path {} is not a directory",
+                path.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(path).map_err(|error| Error::io(path.display(), error))?;
+        }
+        Err(error) => return Err(Error::io(path.display(), error)),
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|error| Error::io(path.display(), error))?;
+    if unsafe_file_metadata(&metadata) || !metadata.is_dir() {
+        return Err(Error::message(format!(
+            "state path {} is not a real directory",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|error| Error::io(path.display(), error))?;
+    Ok(())
+}
+
+pub(crate) fn acquire_vm_lock(paths: &VmPaths) -> Result<FileLock> {
+    ensure_state_directory(&paths.state_dir)?;
     let path = paths.state_dir.join("operation.lock");
     let pid = std::process::id() as i32;
     let token = format!(
@@ -273,30 +353,36 @@ pub(crate) fn acquire_vm_lock(paths: &VmPaths) -> Result<VmOperationLock> {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos())
     );
-    let mut file = open_operation_lock(&path).map_err(|error| Error::io(path.display(), error))?;
-    if let Err(error) = lock_operation_file(&file) {
+    let mut lock = acquire_file_lock(&path).map_err(|error| {
         if error.kind() == io::ErrorKind::WouldBlock {
-            return Err(Error::message(format!(
+            Error::message(format!(
                 "another vmctl operation is already using {}; retry after it finishes",
                 paths.state_dir.display()
-            )));
+            ))
+        } else {
+            Error::io(path.display(), error)
         }
-        return Err(Error::io(path.display(), error));
-    }
-    file.set_len(0)
-        .and_then(|()| file.write_all(token.as_bytes()))
-        .and_then(|()| file.sync_all())
+    })?;
+    lock.file
+        .set_len(0)
+        .and_then(|()| lock.file.write_all(token.as_bytes()))
+        .and_then(|()| lock.file.sync_all())
         .map_err(|error| Error::io(path.display(), error))?;
-    Ok(VmOperationLock { file })
+    Ok(lock)
 }
 
-fn reject_unsafe_operation_lock(path: &Path) -> io::Result<()> {
+fn reject_unsafe_file(path: &Path) -> io::Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
-            if metadata.file_type().is_symlink() {
+            if unsafe_file_metadata(&metadata) {
                 Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "refusing to follow a symbolic-link operation lock",
+                    "refusing to follow a symbolic-link file",
+                ))
+            } else if !metadata.file_type().is_file() {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{} is not a regular file", path.display()),
                 ))
             } else {
                 Ok(())
@@ -307,20 +393,33 @@ fn reject_unsafe_operation_lock(path: &Path) -> io::Result<()> {
     }
 }
 
-fn ensure_regular_operation_lock(path: &Path, file: File) -> io::Result<File> {
-    if file.metadata()?.file_type().is_file() {
+fn ensure_regular_file(path: &Path, file: File) -> io::Result<File> {
+    let metadata = file.metadata()?;
+    if metadata.file_type().is_file() && !unsafe_file_metadata(&metadata) {
         Ok(file)
     } else {
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("operation lock {} is not a regular file", path.display()),
+            format!("{} is not a regular file", path.display()),
         ))
     }
 }
 
+#[cfg(windows)]
+fn unsafe_file_metadata(metadata: &fs::Metadata) -> bool {
+    metadata.file_attributes()
+        & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+        != 0
+}
+
+#[cfg(not(windows))]
+fn unsafe_file_metadata(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
 #[cfg(unix)]
-fn open_operation_lock(path: &Path) -> io::Result<File> {
-    reject_unsafe_operation_lock(path)?;
+fn open_lock_file(path: &Path) -> io::Result<File> {
+    reject_unsafe_file(path)?;
     let file = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -328,14 +427,14 @@ fn open_operation_lock(path: &Path) -> io::Result<File> {
         .truncate(false)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)?;
-    ensure_regular_operation_lock(path, file)
+    ensure_regular_file(path, file)
 }
 
 #[cfg(windows)]
-fn open_operation_lock(path: &Path) -> io::Result<File> {
+fn open_lock_file(path: &Path) -> io::Result<File> {
     use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
 
-    reject_unsafe_operation_lock(path)?;
+    reject_unsafe_file(path)?;
     let file = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -343,23 +442,61 @@ fn open_operation_lock(path: &Path) -> io::Result<File> {
         .truncate(false)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;
-    ensure_regular_operation_lock(path, file)
+    ensure_regular_file(path, file)
 }
 
 #[cfg(not(any(unix, windows)))]
-fn open_operation_lock(path: &Path) -> io::Result<File> {
-    reject_unsafe_operation_lock(path)?;
+fn open_lock_file(path: &Path) -> io::Result<File> {
+    reject_unsafe_file(path)?;
     let file = fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .open(path)?;
-    ensure_regular_operation_lock(path, file)
+    ensure_regular_file(path, file)
 }
 
 #[cfg(unix)]
-fn lock_operation_file(file: &File) -> io::Result<()> {
+pub(crate) fn create_truncated_file(path: &Path) -> io::Result<File> {
+    reject_unsafe_file(path)?;
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    ensure_regular_file(path, file)
+}
+
+#[cfg(windows)]
+pub(crate) fn create_truncated_file(path: &Path) -> io::Result<File> {
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+
+    reject_unsafe_file(path)?;
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    ensure_regular_file(path, file)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn create_truncated_file(path: &Path) -> io::Result<File> {
+    reject_unsafe_file(path)?;
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    ensure_regular_file(path, file)
+}
+
+#[cfg(unix)]
+fn try_lock_file(file: &File) -> io::Result<()> {
     let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if result == 0 {
         Ok(())
@@ -369,12 +506,12 @@ fn lock_operation_file(file: &File) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn unlock_operation_file(file: &File) {
+fn unlock_file(file: &File) {
     let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
 }
 
 #[cfg(windows)]
-fn lock_operation_file(file: &File) -> io::Result<()> {
+fn try_lock_file(file: &File) -> io::Result<()> {
     use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
     use windows_sys::Win32::Storage::FileSystem::LockFile;
 
@@ -391,14 +528,14 @@ fn lock_operation_file(file: &File) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn unlock_operation_file(file: &File) {
+fn unlock_file(file: &File) {
     use windows_sys::Win32::Storage::FileSystem::UnlockFile;
 
     let _ = unsafe { UnlockFile(file.as_raw_handle(), 0, 0, 1, 0) };
 }
 
 #[cfg(not(any(unix, windows)))]
-fn lock_operation_file(_file: &File) -> io::Result<()> {
+fn try_lock_file(_file: &File) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "VM operation locking is unsupported on this platform",
@@ -406,7 +543,7 @@ fn lock_operation_file(_file: &File) -> io::Result<()> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn unlock_operation_file(_file: &File) {}
+fn unlock_file(_file: &File) {}
 
 #[cfg(test)]
 mod tests;

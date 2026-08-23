@@ -129,7 +129,7 @@ fn cache_request(
     }
 
     let lock_path = cache.join("download.lock");
-    let _lock = CacheLock::acquire(&lock_path)?;
+    let _lock = acquire_cache_lock(&lock_path)?;
     let mut index = read_index(&index_path)?;
     if !refresh
         && let Some(entry) = index.get(url)
@@ -161,14 +161,19 @@ fn cache_request(
     let result = (|| {
         download_file(url, &download, insecure)?;
         verify_checksum(&download, checksum)?;
-        let temporary = if file_name.ends_with(".xz") {
+        let compressed_disk = kind == ImageKind::Disk && file_name.ends_with(".xz");
+        let temporary = if compressed_disk {
             prepare_image(&download)?
         } else {
             download.clone()
         };
         let sha256 = checksum_digest(&temporary, "sha256")?;
         let object_name = cache_object_name(
-            file_name.strip_suffix(".xz").unwrap_or(file_name),
+            if compressed_disk {
+                file_name.strip_suffix(".xz").unwrap_or(file_name)
+            } else {
+                file_name
+            },
             kind,
             &sha256,
         )?;
@@ -321,17 +326,9 @@ fn write_index(path: &Path, entries: &serde_json::Map<String, Value>) -> Result<
             path.display()
         )));
     }
-    let temporary = path.with_extension(format!("json.{}.tmp", std::process::id()));
-    if fs::symlink_metadata(&temporary).is_ok() {
-        return Err(Error::message(format!(
-            "temporary cache index already exists: {}",
-            temporary.display()
-        )));
-    }
     let contents = serde_json::to_vec_pretty(&json!({"version": 1, "entries": entries}))
         .expect("JSON values are serializable");
-    fs::write(&temporary, contents).map_err(|error| Error::io(temporary.display(), error))?;
-    fs::rename(&temporary, path).map_err(|error| Error::io(path.display(), error))
+    crate::qemu::write_atomic_file(path, &contents)
 }
 
 fn ensure_cache_directory(path: &Path) -> Result<()> {
@@ -362,7 +359,11 @@ fn cached_entry(objects: &Path, entry: &Value) -> Result<Option<(PathBuf, String
         return Err(Error::message("cache index contains an unsafe object path"));
     }
     let path = objects.join(object);
-    let metadata = fs::symlink_metadata(&path).map_err(|error| Error::io(path.display(), error))?;
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(Error::io(path.display(), error)),
+    };
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(Error::message(format!(
             "cached image is not a regular file: {}",
@@ -383,9 +384,36 @@ fn cache_object_name(file_name: &str, kind: ImageKind, sha256: &str) -> Result<S
         ));
     }
     let path = Path::new(file_name);
-    let stem = path
-        .file_stem()
+    let file_name = path
+        .file_name()
         .and_then(|value| value.to_str())
+        .unwrap_or("image");
+    let extension = if kind == ImageKind::Disk {
+        "qcow2".to_string()
+    } else {
+        let outer = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty())
+            .unwrap_or("image");
+        if kind == ImageKind::Archive
+            && ["gz", "bz2", "xz"]
+                .iter()
+                .any(|extension| outer.eq_ignore_ascii_case(extension))
+        {
+            path.with_extension("")
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(|inner| format!("{inner}.{outer}"))
+                .unwrap_or_else(|| outer.to_string())
+        } else {
+            outer.to_string()
+        }
+    };
+    let suffix = format!(".{extension}");
+    let stem = file_name
+        .strip_suffix(&suffix)
+        .or_else(|| path.file_stem().and_then(|value| value.to_str()))
         .unwrap_or("image");
     let mut stem: String = stem
         .chars()
@@ -404,42 +432,19 @@ fn cache_object_name(file_name: &str, kind: ImageKind, sha256: &str) -> Result<S
     if stem.is_empty() {
         return Err(Error::message("image file name has no safe cache label"));
     }
-    let extension = if kind == ImageKind::Disk {
-        "qcow2"
-    } else {
-        path.extension()
-            .and_then(|value| value.to_str())
-            .filter(|value| !value.is_empty())
-            .unwrap_or("image")
-    };
     Ok(format!("{stem}--sha256-{}.{}", &sha256[..12], extension))
 }
 
-struct CacheLock(PathBuf);
-
-impl CacheLock {
-    fn acquire(path: &Path) -> Result<Self> {
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::AlreadyExists {
-                    Error::message(
-                        "another vmctl image download is using this cache; retry when it finishes",
-                    )
-                } else {
-                    Error::io(path.display(), error)
-                }
-            })?;
-        Ok(Self(path.to_path_buf()))
-    }
-}
-
-impl Drop for CacheLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-    }
+fn acquire_cache_lock(path: &Path) -> Result<crate::qemu::FileLock> {
+    crate::qemu::acquire_file_lock(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            Error::message(
+                "another vmctl image download is using this cache; retry when it finishes",
+            )
+        } else {
+            Error::io(path.display(), error)
+        }
+    })
 }
 
 #[cfg(test)]
@@ -475,6 +480,13 @@ mod tests {
             )
             .unwrap(),
             "FreeBSD-15.1-RELEASE-amd64-BASIC-CLOUDINIT-ufs--sha256-cccccccccccc.qcow2"
+        );
+        let archive =
+            cache_object_name("batocera.img.gz", ImageKind::Archive, &"d".repeat(64)).unwrap();
+        assert_eq!(archive, "batocera--sha256-dddddddddddd.img.gz");
+        assert_eq!(
+            image_kind(&Path::new(&archive).with_extension("").to_string_lossy()),
+            ImageKind::Img
         );
     }
 
@@ -542,5 +554,82 @@ mod tests {
         assert_eq!(source.os, "ubuntu");
         assert_eq!(source.kind, ImageKind::Iso);
         assert!(!source.cloud);
+    }
+
+    #[test]
+    fn missing_cached_object_is_reported_as_incomplete() {
+        let root = tempdir().unwrap();
+        fs::create_dir_all(root.path().join(".cache")).unwrap();
+        fs::write(
+            root.path().join(".cache/index.json"),
+            serde_json::to_vec(&json!({"version": 1, "entries": {
+                "https://example.invalid/ubuntu.iso": {
+                    "object": "missing.iso",
+                    "sha256": "00".repeat(32)
+                }
+            }}))
+            .unwrap(),
+        )
+        .unwrap();
+        let error = cached_source(root.path(), "missing.iso").unwrap_err();
+        assert!(error.to_string().contains("cached image is incomplete"));
+    }
+
+    #[test]
+    fn cache_lock_recovers_after_exit_without_ignoring_a_live_holder() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("download.lock");
+        fs::write(&path, "stale marker").unwrap();
+        let lock = acquire_cache_lock(&path).unwrap();
+        assert!(acquire_cache_lock(&path).is_err());
+        drop(lock);
+        assert!(acquire_cache_lock(&path).is_ok());
+    }
+
+    #[test]
+    fn cache_index_replaces_an_existing_file_and_cleans_failed_temporary_files() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("index.json");
+        write_index(
+            &path,
+            &serde_json::Map::from_iter([("old".into(), json!(1))]),
+        )
+        .unwrap();
+        write_index(
+            &path,
+            &serde_json::Map::from_iter([("new".into(), json!(2))]),
+        )
+        .unwrap();
+        assert_eq!(read_index(&path).unwrap().get("new"), Some(&json!(2)));
+
+        let blocked = root.path().join("blocked.json");
+        fs::create_dir(&blocked).unwrap();
+        assert!(write_index(&blocked, &serde_json::Map::new()).is_err());
+        assert!(
+            !blocked
+                .with_extension(format!("json.{}.tmp", std::process::id()))
+                .exists()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_index_ignores_the_old_predictable_temporary_path() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().unwrap();
+        let path = root.path().join("index.json");
+        let victim = root.path().join("victim");
+        let old_temporary = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        fs::write(&victim, b"original").unwrap();
+        symlink(&victim, old_temporary).unwrap();
+
+        write_index(
+            &path,
+            &serde_json::Map::from_iter([("safe".into(), json!(true))]),
+        )
+        .unwrap();
+        assert_eq!(fs::read(victim).unwrap(), b"original");
+        assert_eq!(read_index(&path).unwrap().get("safe"), Some(&json!(true)));
     }
 }

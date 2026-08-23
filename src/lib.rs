@@ -10,7 +10,7 @@ mod qemu;
 use std::collections::BTreeSet;
 use std::env;
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
@@ -37,10 +37,10 @@ use qemu::{
     HostCapabilities, acquire_vm_lock, build_plan, configured_bridge, disk_check, disk_compact,
     disk_convert, disk_info, disk_resize, disk_snapshot, ensure_disk,
     ensure_ipc_endpoints_available, guest_command, guest_exec, guest_shutdown, ipc_report,
-    kill_process, qemu_capability_report, qmp_ping, qmp_status, remove_runtime_sockets,
-    render_node, send_monitor_command, shell_join, shutdown_via_qmp, spice_address, start_tpm,
-    start_virtiofsd, stop_tpm, stop_virtiofsd, virtiofs_requested, virtiofsd_available,
-    wait_for_exit, write_runtime_files,
+    kill_process, qemu_capability_report, qmp_live_resources, qmp_ping, qmp_status,
+    remove_runtime_sockets, render_node, send_monitor_command, shell_join, shutdown_via_qmp,
+    spice_address, start_tpm, start_virtiofsd, stop_tpm, stop_virtiofsd, virtiofs_requested,
+    virtiofsd_available, wait_for_exit, write_runtime_files,
 };
 
 pub const AGENT_SCHEMA_VERSION: u32 = 1;
@@ -74,7 +74,40 @@ pub fn run(cli: Cli) -> Result<()> {
         VmCommand::List => list_vms(&dirs, output),
         VmCommand::Schema => unreachable!("schema handled before path setup"),
         VmCommand::Completion { .. } => unreachable!("completion handled before path setup"),
-        VmCommand::Status { vm } => status_vms(&dirs, vm.as_deref(), output),
+        VmCommand::Status { vm, live } => status_vms(&dirs, vm.as_deref(), live, output),
+        VmCommand::Set {
+            vm,
+            ram,
+            cpu_cores,
+            disk_size,
+            cpu_model,
+            cpu_pinning,
+            macaddr,
+            bridge,
+            port_forwards,
+            boot_menu,
+            boot_once,
+            disk_cache,
+            disk_aio,
+            discard,
+        } => set_vm(
+            &dirs,
+            &vm,
+            ram.as_deref(),
+            cpu_cores,
+            disk_size.as_deref(),
+            cpu_model.as_deref(),
+            cpu_pinning.as_deref(),
+            macaddr.as_deref(),
+            bridge.as_deref(),
+            &port_forwards,
+            boot_menu.as_deref(),
+            boot_once.as_deref(),
+            disk_cache.as_deref(),
+            disk_aio.as_deref(),
+            discard.as_deref(),
+            output,
+        ),
         VmCommand::Plan {
             vm,
             redact,
@@ -99,8 +132,9 @@ pub fn run(cli: Cli) -> Result<()> {
         } => {
             let mut vm = find(&dirs.vm_dir, &dirs.state_root, &vm)?;
             let _operation_lock = acquire_vm_lock(&vm.paths)?;
-            stop_vm_loaded(&vm, timeout, force, output, false)?;
             apply_launch_options(&mut vm, &options)?;
+            preflight_vm(&vm, output == OutputFormat::Json)?;
+            stop_vm_loaded(&vm, timeout, force, output, false)?;
             start_vm_loaded(&vm, output, None)
         }
         VmCommand::Snapshot { vm, action } => snapshot_vm(&dirs, &vm, action, output),
