@@ -28,15 +28,16 @@ use serde_json::{Value, json};
 pub(crate) use agent::print_json_success;
 
 use cli::{
-    Cli, Command as VmCommand, DiskAction, GuestAction, HostAction, LaunchOptions, OutputFormat,
-    SnapshotAction, StartWait,
+    CacheAction, Cli, Command as VmCommand, DiskAction, GuestAction, HostAction, LaunchOptions,
+    OutputFormat, SnapshotAction, StartWait,
 };
 use config::{discover, find};
 use paths::Dirs;
 use qemu::{
     HostCapabilities, acquire_vm_lock, build_plan, configured_bridge, disk_check, disk_compact,
     disk_convert, disk_info, disk_resize, disk_snapshot, ensure_disk,
-    ensure_ipc_endpoints_available, guest_command, guest_exec, guest_shutdown, ipc_report,
+    ensure_ipc_endpoints_available, guest_command, guest_exec, guest_fsfreeze_freeze,
+    guest_fsfreeze_status, guest_fsfreeze_thaw, guest_fstrim, guest_shutdown, ipc_report,
     kill_process, qemu_capability_report, qmp_live_resources, qmp_ping, qmp_status,
     remove_runtime_sockets, render_node, send_monitor_command, shell_join, shutdown_via_qmp,
     spice_address, start_tpm, start_virtiofsd, stop_tpm, stop_virtiofsd, virtiofs_requested,
@@ -138,6 +139,9 @@ pub fn run(cli: Cli) -> Result<()> {
             start_vm_loaded(&vm, output, None)
         }
         VmCommand::Snapshot { vm, action } => snapshot_vm(&dirs, &vm, action, output),
+        VmCommand::Cache { action } => cache_vm(&dirs, action, output),
+        VmCommand::Backup { vm, destination } => backup_vm(&dirs, &vm, &destination, output),
+        VmCommand::Reset { vm, yes } => reset_cloud_vm(&dirs, &vm, yes, output),
         VmCommand::Disk { vm, action } => disk_vm(&dirs, &vm, action, output),
         VmCommand::DeleteDisk { vm, yes } => delete_disk(&dirs, &vm, yes, output),
         VmCommand::DeleteVm { vm, yes } => delete_vm(&dirs, &vm, yes, output),
@@ -174,6 +178,9 @@ use lifecycle::*;
 #[path = "commands/storage.rs"]
 mod storage;
 use storage::*;
+#[path = "commands/cache.rs"]
+mod cache;
+use cache::*;
 #[path = "commands/guest.rs"]
 mod guest;
 use guest::*;

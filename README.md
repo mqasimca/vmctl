@@ -12,6 +12,7 @@ vmctl plan VM --output json        # inspect the exact QEMU invocation
 vmctl plan VM --output json --redact # omit sensitive inline values
 vmctl start VM                     # create missing disk/EFI state and start
 vmctl start VM --wait ssh          # start and wait for the guest SSH banner
+vmctl start VM --wait cloud-init   # wait for SSH, then cloud-init completion
 vmctl start VM --ssh-access remote # explicitly expose SSH beyond localhost
 vmctl start VM --clipboard         # enable GTK host-guest clipboard sharing
 vmctl start VM --viewer-extra-args --foo value
@@ -24,7 +25,14 @@ vmctl logs VM --lines 100           # inspect a redacted QEMU log tail
 vmctl guest VM ping                # use the QEMU Guest Agent
 vmctl guest VM shutdown --timeout 30
 vmctl guest VM exec --timeout 30 PROGRAM ARG...
+vmctl guest VM freeze              # quiesce filesystems for an external backup
+vmctl guest VM thaw
+vmctl guest VM trim                # discard freed filesystem blocks
 vmctl snapshot VM create TAG       # stopped-disk snapshot
+vmctl cache prune                  # list unreferenced cached images
+vmctl cache prune --yes            # remove listed cached images
+vmctl backup VM ./VM-backup        # create a stopped-VM recovery backup
+vmctl reset VM --yes               # recreate a linked cloud VM's writable disk
 vmctl disk VM info                 # qemu-img disk metadata
 vmctl disk VM resize 32G           # grow a stopped disk
 vmctl disk VM check                 # stopped-disk integrity check
@@ -45,6 +53,7 @@ vmctl create ubuntu-lab --from <cached-image>  # press Tab to complete it
 vmctl create ubuntu-lab --from <cached-image> --ram 8G --cpu-cores 4 --disk-size 64G
 vmctl get --cloud freebsd 15.1      # download a ZFS cloud QCOW2 into the shared cache
 vmctl create freebsd-01 --from <cached-image> --ssh-key ~/.ssh/id_ed25519.pub
+vmctl create bootstrap --from <cached-image> --user-data ./cloud-init.yaml
 vmctl start freebsd-01 --wait ssh   # boot a cloud VM and wait for SSH
 vmctl start freebsd-01 --ram 2G --cpu-cores 2 # one-run resource override
 vmctl set freebsd-01 --ram 4G --cpu-cores 4 --disk-size 64G # persist resources
@@ -229,7 +238,9 @@ vmctl ssh web-01
 The default login is `ubuntu`, `debian`, `fedora`, or `freebsd` for the respective image;
 `vmctl ssh` selects it automatically and `--user` still overrides it. Use
 `--hostname NAME` to set the guest hostname and `--network-config PATH` to add
-a cloud-init network configuration. `vmctl get --cloud --url …` prints the
+a cloud-init network configuration. Use `--user-data PATH` to provide complete
+raw cloud-init configuration; it is intentionally mutually exclusive with
+`--ssh-key`, so vmctl never attempts YAML merging. `vmctl get --cloud --url …` prints the
 resolved image URL, while `--check` performs a read-only availability check.
 FreeBSD cloud images use ZFS and configure passwordless `doas` for the
 SSH-key-provisioned `freebsd` user; the upstream default passwords are replaced
@@ -243,6 +254,22 @@ objects use readable, collision-resistant names such as
 `<vm-dir>/.cache/objects/`. Use `--refresh-cache` to download a new copy
 deliberately.
 
+`vmctl cache prune` is a dry run. It parses every configuration and lists only
+unreferenced cache objects; `--yes` removes those objects and their cache-index
+entries. There is no automatic eviction. `vmctl reset VM --yes` is available
+only for the standard linked cloud-disk layout and recreates its writable overlay
+and UEFI variables from the verified cache base.
+
+`vmctl backup VM DIRECTORY` requires the VM to be stopped. It creates a new
+directory with a flattened compressed QCOW2 disk, `source.conf` for reference,
+cloud seed media when present, owned UEFI variables, and `backup.json`. It is a
+recovery backup, not a live migration or an import format.
+
+For Ubuntu cloud images, `vmctl get --cloud ubuntu RELEASE --manifest-keyring
+PATH` verifies `SHA256SUMS.gpg` with `gpgv` before trusting the image checksum.
+The keyring is explicit so vmctl does not download trust roots; the option is
+currently Ubuntu-only.
+
 These optional programs enable additional features:
 
 - `swtpm` for virtual TPM 2.0 devices
@@ -251,6 +278,7 @@ These optional programs enable additional features:
   sharing
 - `usbutils` for clear USB pass-through preflight checks
 - `qemu-bridge-helper` for bridged networking
+- `gpgv` plus a trusted Ubuntu keyring for `get --manifest-keyring`
 
 `remote-viewer` is the default SPICE client. Set `viewer="spicy"` to use the
 alternative GTK client explicitly.
@@ -354,6 +382,11 @@ requires `--shrink --yes`, repairs require `--repair --yes`, conversion refuses
 to overwrite an existing file unless `--force` is supplied, and compaction
 requires `--yes` because it replaces the image and does not preserve internal
 snapshots.
+
+`guest freeze`, `guest thaw`, `guest freeze-status`, and `guest trim` expose the
+corresponding QEMU Guest Agent operations for VMs with a responsive guest agent.
+Use freeze/thaw around an external live-storage workflow; stopped `vmctl backup`
+does not need them.
 
 On Linux, a Linux VM with an existing disk and a configured `public_dir` uses
 virtiofs when both `virtiofsd` and the QEMU device are available. Installer

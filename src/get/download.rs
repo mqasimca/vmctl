@@ -80,6 +80,8 @@ pub(super) fn download_cached_image(
 
 pub(super) fn create_cached_vm(args: &CreateArgs, dirs: &Dirs, output: OutputFormat) -> Result<()> {
     let resources = VmResources::from_create(args)?;
+    // ponytail: global cache lock; add per-object leases only if concurrent creation is a bottleneck.
+    let _cache_lock = cache_lock(&dirs.vm_dir)?;
     let source = cached_source(&dirs.vm_dir, &args.image)?;
     if source.cloud {
         return create_cached_cloud_vm(args, dirs, source, output);
@@ -88,10 +90,11 @@ pub(super) fn create_cached_vm(args: &CreateArgs, dirs: &Dirs, output: OutputFor
         || !args.ssh_keys.is_empty()
         || args.hostname.is_some()
         || args.network_config.is_some()
+        || args.user_data.is_some()
     {
         return Err(Error::invalid_argument(
             "cloud options",
-            "--disk-mode, --ssh-key, --hostname, and --network-config require a cached cloud image",
+            "--disk-mode, --ssh-key, --hostname, --network-config, and --user-data require a cached cloud image",
         ));
     }
     let name = validate_vm_name(&args.name)?;

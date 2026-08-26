@@ -54,6 +54,19 @@ fn cloud_get_selects_a_download_without_requiring_a_key() {
 }
 
 #[test]
+fn manifest_keyring_is_limited_to_cloud_downloads() {
+    let args = GetArgs {
+        cloud: true,
+        os: Some("ubuntu".to_string()),
+        release_or_input: Some("24.04".to_string()),
+        manifest_keyring: Some(PathBuf::from("ubuntu.gpg")),
+        ..GetArgs::default()
+    };
+    assert!(validate_operation_arguments(&args, Operation::CreateCloudVm, false).is_ok());
+    assert!(validate_operation_arguments(&args, Operation::CreateVm, false).is_err());
+}
+
+#[test]
 fn create_requires_a_cached_image_name() {
     assert!(cached_source(tempdir().unwrap().path(), "../image.iso").is_err());
 }
@@ -272,6 +285,7 @@ fn create_resources_reject_relative_sizes_and_zero_cpus() {
         ssh_keys: Vec::new(),
         hostname: None,
         network_config: None,
+        user_data: None,
     };
     assert!(VmResources::from_create(&args).is_err());
     args.disk_size = None;
@@ -523,6 +537,7 @@ fn cached_xz_archive_is_unpacked_when_the_vm_is_created() {
             ssh_keys: Vec::new(),
             hostname: None,
             network_config: None,
+            user_data: None,
         },
         &dirs,
         OutputFormat::Human,

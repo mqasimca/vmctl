@@ -516,3 +516,191 @@ pub(super) fn delete_vm(dirs: &Dirs, name: &str, yes: bool, output: OutputFormat
     }
     Ok(())
 }
+
+pub(super) fn backup_vm(
+    dirs: &Dirs,
+    name: &str,
+    destination: &Path,
+    output: OutputFormat,
+) -> Result<()> {
+    let vm = find(&dirs.vm_dir, &dirs.state_root, name)?;
+    let _operation_lock = acquire_vm_lock(&vm.paths)?;
+    require_stopped_disk(&vm, "backup")?;
+    if fs::symlink_metadata(destination).is_ok() {
+        return Err(Error::message(format!(
+            "backup destination already exists: {}",
+            destination.display()
+        )));
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).map_err(|error| Error::io(parent.display(), error))?;
+    }
+    fs::create_dir(destination).map_err(|error| Error::io(destination.display(), error))?;
+    let result = (|| {
+        let disk_path = destination.join("disk.qcow2");
+        let disk = disk_convert(&vm.config.disk_img, &disk_path, "qcow2", true, false)?;
+        let mut files = vec!["disk.qcow2".to_string()];
+
+        copy_backup_file(&vm.config.config_path, &destination.join("source.conf"))?;
+        files.push("source.conf".to_string());
+        if let Some(seed) = vm.config.cloud_init_iso.as_deref() {
+            copy_backup_file(seed, &destination.join("cloud-init.iso"))?;
+            files.push("cloud-init.iso".to_string());
+        }
+        for (index, vars) in persistent_efi_vars(&vm).into_iter().enumerate() {
+            match fs::symlink_metadata(&vars) {
+                Ok(_) => {
+                    let name = vars
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("vars.fd");
+                    let backup_name = format!("firmware-{index}-{name}");
+                    copy_backup_file(&vars, &destination.join(&backup_name))?;
+                    files.push(backup_name);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(Error::io(vars.display(), error)),
+            }
+        }
+        let manifest = json!({
+            "schema_version": 1,
+            "name": vm.config.name,
+            "source_config": vm.config.config_path,
+            "files": files,
+            "disk": disk,
+        });
+        crate::qemu::write_atomic_file(
+            &destination.join("backup.json"),
+            &serde_json::to_vec_pretty(&manifest).expect("JSON values are serializable"),
+        )?;
+        Ok(manifest)
+    })();
+    let manifest = match result {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            let _ = fs::remove_dir_all(destination);
+            return Err(error);
+        }
+    };
+    if output == OutputFormat::Json {
+        print_json_success(
+            json!({"name": vm.config.name, "backup": destination, "manifest": manifest}),
+        );
+    } else {
+        println!("Backed up {} to {}", vm.config.name, destination.display());
+    }
+    Ok(())
+}
+
+pub(super) fn reset_cloud_vm(
+    dirs: &Dirs,
+    name: &str,
+    yes: bool,
+    output: OutputFormat,
+) -> Result<()> {
+    let vm = find(&dirs.vm_dir, &dirs.state_root, name)?;
+    let _operation_lock = acquire_vm_lock(&vm.paths)?;
+    ensure_delete_allowed(&vm, yes)?;
+    let base = vm.config.cloud_base_img.as_deref().ok_or_else(|| {
+        Error::message("cloud reset requires a linked cloud VM created from the shared cache")
+    })?;
+    if vm.config.cloud_init_iso.is_none() {
+        return Err(Error::message(
+            "cloud reset requires a cloud-init seed image in the VM configuration",
+        ));
+    }
+    let data_dir = dirs.vm_dir.join(&vm.config.name);
+    if vm.config.disk_img != data_dir.join("disk.qcow2") {
+        return Err(Error::message(
+            "cloud reset supports the standard VM disk layout only",
+        ));
+    }
+    let objects = dirs.vm_dir.join(".cache/objects");
+    let object = base
+        .strip_prefix(&objects)
+        .ok()
+        .filter(|path| path.components().count() == 1)
+        .and_then(|path| path.to_str())
+        .ok_or_else(|| Error::message("cloud reset requires a shared-cache base image"))?;
+    disk_info(base)?;
+    let previous = vm.config.disk_img.with_file_name(format!(
+        ".{}.vmctl-reset-{}.bak",
+        vm.config
+            .disk_img
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("disk"),
+        std::process::id()
+    ));
+    if fs::symlink_metadata(&previous).is_ok() {
+        return Err(Error::message(format!(
+            "temporary reset disk already exists: {}",
+            previous.display()
+        )));
+    }
+    let had_disk = match fs::symlink_metadata(&vm.config.disk_img) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(Error::message(format!(
+                "refusing to reset disk symlink {}",
+                vm.config.disk_img.display()
+            )));
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(Error::message(format!(
+                "cloud disk is not a regular file: {}",
+                vm.config.disk_img.display()
+            )));
+        }
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(Error::io(vm.config.disk_img.display(), error)),
+    };
+    if had_disk {
+        fs::rename(&vm.config.disk_img, &previous)
+            .map_err(|error| Error::io(previous.display(), error))?;
+    }
+    let backing = format!("../.cache/objects/{object}");
+    let result = (|| {
+        crate::qemu::create_cloud_overlay(base, &vm.config.disk_img, &backing)?;
+        disk_resize(&vm.config.disk_img, &vm.config.disk_size, false)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = remove_if_present(&vm.config.disk_img);
+        if had_disk {
+            let _ = fs::rename(&previous, &vm.config.disk_img);
+        }
+        return Err(error);
+    }
+    for path in persistent_efi_vars(&vm) {
+        if let Err(error) = remove_if_present(&path) {
+            return Err(Error::message(format!(
+                "cloud disk was reset, but UEFI variable cleanup failed: {error}"
+            )));
+        }
+    }
+    if had_disk {
+        remove_if_present(&previous)?;
+    }
+    if output == OutputFormat::Json {
+        print_json_success(
+            json!({"name": vm.config.name, "reset": true, "disk": vm.config.disk_img}),
+        );
+    } else {
+        println!("Reset {} to its cached cloud image", vm.config.name);
+    }
+    Ok(())
+}
+
+fn copy_backup_file(source: &Path, destination: &Path) -> Result<()> {
+    let metadata =
+        fs::symlink_metadata(source).map_err(|error| Error::io(source.display(), error))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(Error::message(format!(
+            "backup source is not a regular file: {}",
+            source.display()
+        )));
+    }
+    fs::copy(source, destination).map_err(|error| Error::io(destination.display(), error))?;
+    Ok(())
+}

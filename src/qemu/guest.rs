@@ -8,6 +8,33 @@ pub(crate) fn guest_shutdown(vm: &Vm, deadline: Instant) -> Result<Value> {
     guest_command_until(vm, "guest-shutdown", None, deadline, false)
 }
 
+pub(crate) fn guest_fsfreeze_status(vm: &Vm) -> Result<String> {
+    guest_command(vm, "guest-fsfreeze-status", None)?
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            Error::guest_agent_protocol("guest-fsfreeze-status", "response is not a string")
+        })
+}
+
+pub(crate) fn guest_fsfreeze_freeze(vm: &Vm) -> Result<u64> {
+    guest_fsfreeze_count(vm, "guest-fsfreeze-freeze")
+}
+
+pub(crate) fn guest_fsfreeze_thaw(vm: &Vm) -> Result<u64> {
+    guest_fsfreeze_count(vm, "guest-fsfreeze-thaw")
+}
+
+pub(crate) fn guest_fstrim(vm: &Vm) -> Result<Value> {
+    guest_command(vm, "guest-fstrim", None)
+}
+
+fn guest_fsfreeze_count(vm: &Vm, command: &str) -> Result<u64> {
+    guest_command(vm, command, None)?.as_u64().ok_or_else(|| {
+        Error::guest_agent_protocol(command, "response is not a non-negative integer")
+    })
+}
+
 pub(super) fn guest_command_with_timeout(
     vm: &Vm,
     command: &str,

@@ -75,6 +75,19 @@ pub(super) fn guest_vm(
             "guest-network-get-interfaces",
             guest_command(&vm, "guest-network-get-interfaces", None)?,
         ),
+        GuestAction::FreezeStatus => (
+            "guest-fsfreeze-status",
+            json!({"status": guest_fsfreeze_status(&vm)?}),
+        ),
+        GuestAction::Freeze => (
+            "guest-fsfreeze-freeze",
+            json!({"frozen_filesystems": guest_fsfreeze_freeze(&vm)?}),
+        ),
+        GuestAction::Thaw => (
+            "guest-fsfreeze-thaw",
+            json!({"thawed_filesystems": guest_fsfreeze_thaw(&vm)?}),
+        ),
+        GuestAction::Trim => ("guest-fstrim", guest_fstrim(&vm)?),
         GuestAction::Exec {
             timeout,
             program,

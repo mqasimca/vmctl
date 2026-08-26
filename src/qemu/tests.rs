@@ -1739,6 +1739,53 @@ fn guest_agent_commands_synchronize_each_connection() {
 }
 
 #[test]
+fn guest_agent_filesystem_helpers_use_the_expected_commands() {
+    #[cfg(unix)]
+    {
+        let root = tempdir().unwrap();
+        let config_path = root.path().join("guest-agent.conf");
+        fs::write(&config_path, "guest_agent=true\n").unwrap();
+        let vm = load_vm(root.path(), root.path(), config_path).unwrap();
+        fs::create_dir_all(&vm.paths.state_dir).unwrap();
+        let listener = UnixListener::bind(vm.paths.agent_socket()).unwrap();
+        let server = thread::spawn(move || {
+            for (command, response) in [
+                ("guest-fsfreeze-status", "\"thawed\""),
+                ("guest-fsfreeze-freeze", "2"),
+                ("guest-fsfreeze-thaw", "2"),
+                ("guest-fstrim", "{}"),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut marker = [0_u8; 1];
+                reader.read_exact(&mut marker).unwrap();
+                assert_eq!(marker, [0xff]);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let sync: Value = serde_json::from_str(line.trim()).unwrap();
+                let id = sync["arguments"]["id"].as_i64().unwrap();
+                stream.write_all(&[0xff]).unwrap();
+                stream
+                    .write_all(format!("{{\"return\":{id}}}\n").as_bytes())
+                    .unwrap();
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                let request: Value = serde_json::from_str(line.trim()).unwrap();
+                assert_eq!(request["execute"], command);
+                stream
+                    .write_all(format!("{{\"return\":{response}}}\n").as_bytes())
+                    .unwrap();
+            }
+        });
+        assert_eq!(guest_fsfreeze_status(&vm).unwrap(), "thawed");
+        assert_eq!(guest_fsfreeze_freeze(&vm).unwrap(), 2);
+        assert_eq!(guest_fsfreeze_thaw(&vm).unwrap(), 2);
+        guest_fstrim(&vm).unwrap();
+        server.join().unwrap();
+    }
+}
+
+#[test]
 fn guest_agent_response_limit_is_enforced_while_reading() {
     let mut reader = BufReader::new(io::Cursor::new(b"12345\n"));
     let error = read_bounded_line(&mut reader, 4).unwrap_err();

@@ -14,7 +14,7 @@ pub(super) fn resolve_requested_image(
     architecture: &str,
 ) -> Result<ResolvedImage> {
     if cloud {
-        resolve_cloud_image(os, release, architecture).map(|image| image.image)
+        resolve_cloud_image(os, release, architecture, None).map(|image| image.image)
     } else {
         resolve_remote_image(os, release, edition, architecture)
     }
@@ -24,11 +24,18 @@ pub(super) fn resolve_cloud_image(
     os: &str,
     release: &str,
     architecture: &str,
+    manifest_keyring: Option<&Path>,
 ) -> Result<CloudImage> {
     let os = find_os(os)?.id;
     let architecture = normalize_architecture(architecture)?;
+    if manifest_keyring.is_some() && os != "ubuntu" {
+        return Err(Error::invalid_argument(
+            "--manifest-keyring",
+            "currently supports Ubuntu cloud image manifests only",
+        ));
+    }
     let (url, file_name, checksum, ssh_user) = match os {
-        "ubuntu" => ubuntu_cloud(release, architecture)?,
+        "ubuntu" => ubuntu_cloud(release, architecture, manifest_keyring)?,
         "debian" => debian_cloud(release, architecture)?,
         "fedora" => fedora_cloud(release, architecture)?,
         "freebsd" => freebsd_cloud(release, architecture)?,
@@ -86,6 +93,7 @@ fn freebsd_cloud_from_manifest(
 fn ubuntu_cloud(
     release: &str,
     architecture: &str,
+    manifest_keyring: Option<&Path>,
 ) -> Result<(String, String, String, &'static str)> {
     let arch = if architecture == "amd64" {
         "amd64"
@@ -94,16 +102,65 @@ fn ubuntu_cloud(
     };
     let directory = format!("https://cloud-images.ubuntu.com/releases/{release}/release");
     let file_name = format!("ubuntu-{release}-server-cloudimg-{arch}.img");
-    let checksum = checksum_for(
-        &fetch_text(&format!("{directory}/SHA256SUMS"))?,
-        &file_name,
-        "sha256",
-    )?;
+    let manifest_url = format!("{directory}/SHA256SUMS");
+    let manifest = fetch_text(&manifest_url)?;
+    if let Some(keyring) = manifest_keyring {
+        verify_ubuntu_manifest(&manifest, &manifest_url, keyring)?;
+    }
+    let checksum = checksum_for(&manifest, &file_name, "sha256")?;
     Ok((
         format!("{directory}/{file_name}"),
         file_name,
         checksum,
         "ubuntu",
+    ))
+}
+
+fn verify_ubuntu_manifest(manifest: &str, manifest_url: &str, keyring: &Path) -> Result<()> {
+    let metadata =
+        fs::symlink_metadata(keyring).map_err(|error| Error::io(keyring.display(), error))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(Error::invalid_argument(
+            "--manifest-keyring",
+            format!("{} is not a regular keyring file", keyring.display()),
+        ));
+    }
+    let staging = signature_staging_directory()?;
+    let manifest_path = staging.join("SHA256SUMS");
+    let signature_path = staging.join("SHA256SUMS.gpg");
+    let result = (|| {
+        fs::write(&manifest_path, manifest)
+            .map_err(|error| Error::io(manifest_path.display(), error))?;
+        download_file(&format!("{manifest_url}.gpg"), &signature_path, false)?;
+        let output = Command::new("gpgv")
+            .arg("--keyring")
+            .arg(keyring)
+            .arg(&signature_path)
+            .arg(&manifest_path)
+            .output()
+            .map_err(|error| Error::command_unavailable("gpgv", error))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(Error::command_failed_status("gpgv", output.status))
+        }
+    })();
+    let _ = fs::remove_dir_all(&staging);
+    result
+}
+
+fn signature_staging_directory() -> Result<PathBuf> {
+    let base = env::temp_dir();
+    for attempt in 0..100_u32 {
+        let path = base.join(format!("vmctl-signature-{}-{attempt}", std::process::id()));
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(Error::io(path.display(), error)),
+        }
+    }
+    Err(Error::message(
+        "could not create a private signature staging directory",
     ))
 }
 
@@ -230,7 +287,7 @@ pub(super) fn download_cached_cloud_image(
         .into_iter()
         .next()
         .ok_or_else(|| Error::message("an architecture is required"))?;
-    let cloud = resolve_cloud_image(os, release, &architecture)?;
+    let cloud = resolve_cloud_image(os, release, &architecture, args.manifest_keyring.as_deref())?;
     fs::create_dir_all(&dirs.vm_dir).map_err(|error| Error::io(dirs.vm_dir.display(), error))?;
     let cached = cache_image(
         &dirs.vm_dir,
@@ -247,6 +304,7 @@ pub(super) fn download_cached_cloud_image(
         "url": cloud.image.url,
         "kind": "cloud",
         "image": cached.path,
+        "manifest_signature_verified": args.manifest_keyring.is_some(),
         "cache": { "status": cached.status.as_str(), "object": cached.path, "sha256": cached.sha256 },
     });
     if output == OutputFormat::Json {
@@ -280,10 +338,16 @@ pub(super) fn create_cached_cloud_vm(
     output: OutputFormat,
 ) -> Result<()> {
     let resources = VmResources::from_create(args)?;
-    if args.ssh_keys.is_empty() {
+    if args.user_data.is_some() && !args.ssh_keys.is_empty() {
         return Err(Error::invalid_argument(
-            "--ssh-key",
-            "at least one OpenSSH public key is required for a cloud VM",
+            "--user-data",
+            "cannot be combined with --ssh-key; provide complete cloud-init user-data instead",
+        ));
+    }
+    if args.ssh_keys.is_empty() && args.user_data.is_none() {
+        return Err(Error::invalid_argument(
+            "cloud provisioning",
+            "provide --ssh-key or an explicit --user-data file",
         ));
     }
     let name = validate_vm_name(&args.name)?;
@@ -311,6 +375,7 @@ pub(super) fn create_cached_cloud_vm(
             &source.os,
             hostname,
             &args.ssh_keys,
+            args.user_data.as_deref(),
             args.network_config.as_deref(),
         )?;
         if disk_mode == DiskMode::Linked {
@@ -373,6 +438,7 @@ pub(super) fn create_cloud_seed(
     os: &str,
     hostname: &str,
     keys: &[PathBuf],
+    user_data: Option<&Path>,
     network_config: Option<&Path>,
 ) -> Result<PathBuf> {
     let seed = target_dir.join("seed.iso");
@@ -384,9 +450,13 @@ pub(super) fn create_cloud_seed(
     }
     let staging = extraction_directory(target_dir)?;
     let result = (|| {
-        let keys = read_public_keys(keys)?;
-        fs::write(staging.join("user-data"), cloud_user_data(os, &keys))
-            .map_err(|error| Error::io(staging.display(), error))?;
+        if let Some(user_data) = user_data {
+            copy_cloud_user_data(user_data, &staging.join("user-data"))?;
+        } else {
+            let keys = read_public_keys(keys)?;
+            fs::write(staging.join("user-data"), cloud_user_data(os, &keys))
+                .map_err(|error| Error::io(staging.display(), error))?;
+        }
         let instance_id = format!(
             "vmctl-{}-{}",
             hostname,
@@ -421,6 +491,25 @@ pub(super) fn create_cloud_seed(
     let _ = fs::remove_dir_all(&staging);
     result?;
     Ok(seed)
+}
+
+fn copy_cloud_user_data(source: &Path, destination: &Path) -> Result<()> {
+    let metadata =
+        fs::symlink_metadata(source).map_err(|error| Error::io(source.display(), error))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(Error::invalid_argument(
+            "--user-data",
+            format!("{} is not a regular file", source.display()),
+        ));
+    }
+    if metadata.len() == 0 || metadata.len() > 1024 * 1024 {
+        return Err(Error::invalid_argument(
+            "--user-data",
+            "must be between 1 byte and 1 MiB",
+        ));
+    }
+    fs::copy(source, destination).map_err(|error| Error::io(destination.display(), error))?;
+    Ok(())
 }
 
 fn cloud_user_data(os: &str, keys: &[String]) -> String {
@@ -551,6 +640,36 @@ mod tests {
     }
 
     #[test]
+    fn custom_cloud_user_data_is_copied_without_rewriting() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("user-data");
+        let destination = root.path().join("copied-user-data");
+        let contents = "#cloud-config\nruncmd:\n  - echo ready\n";
+        fs::write(&source, contents).unwrap();
+
+        copy_cloud_user_data(&source, &destination).unwrap();
+        assert_eq!(fs::read_to_string(destination).unwrap(), contents);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_verification_rejects_a_keyring_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().unwrap();
+        let keyring = root.path().join("keyring");
+        fs::write(root.path().join("real-keyring"), "key").unwrap();
+        symlink(root.path().join("real-keyring"), &keyring).unwrap();
+
+        assert!(
+            verify_ubuntu_manifest("", "https://example.invalid/SHA256SUMS", &keyring)
+                .unwrap_err()
+                .to_string()
+                .contains("regular keyring")
+        );
+    }
+
+    #[test]
     fn debian_versions_resolve_to_upstream_codenames() {
         assert_eq!(debian_cloud_release("13"), "trixie");
         assert_eq!(debian_cloud_release("trixie"), "trixie");
@@ -619,6 +738,7 @@ mod tests {
             ssh_keys: vec![key],
             hostname: None,
             network_config: None,
+            user_data: None,
         };
         let error =
             create_cached_cloud_vm(&args, &dirs, source.clone(), OutputFormat::Human).unwrap_err();

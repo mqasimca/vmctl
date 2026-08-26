@@ -76,6 +76,116 @@ fn command_line_parses_ssh_readiness_wait() {
 }
 
 #[test]
+fn command_line_parses_cloud_lifecycle_and_cache_commands() {
+    let cli = Cli::try_parse_from(["vmctl", "start", "cloud", "--wait", "cloud-init"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(VmCommand::Start {
+            wait: Some(StartWait::CloudInit),
+            ..
+        })
+    ));
+
+    let cli = Cli::try_parse_from([
+        "vmctl",
+        "create",
+        "cloud",
+        "--from",
+        "base.qcow2",
+        "--user-data",
+        "cloud.yaml",
+    ])
+    .unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(VmCommand::Create(args))
+            if args.user_data == Some(PathBuf::from("cloud.yaml"))
+    ));
+
+    let cli = Cli::try_parse_from(["vmctl", "cache", "prune", "--yes"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(VmCommand::Cache {
+            action: CacheAction::Prune { yes: true }
+        })
+    ));
+    let cli = Cli::try_parse_from(["vmctl", "backup", "cloud", "backup-dir"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(VmCommand::Backup { vm, destination })
+            if vm == "cloud" && destination == *"backup-dir"
+    ));
+    let cli = Cli::try_parse_from(["vmctl", "reset", "cloud", "--yes"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(VmCommand::Reset { vm, yes: true }) if vm == "cloud"
+    ));
+    let cli = Cli::try_parse_from(["vmctl", "guest", "cloud", "trim"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(VmCommand::Guest {
+            action: GuestAction::Trim,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn cloud_init_wait_rejects_a_non_cloud_vm_before_starting() {
+    let root = tempfile::tempdir().unwrap();
+    let dirs = Dirs {
+        vm_dir: root.path().join("vms"),
+        state_root: root.path().join("state"),
+    };
+    std::fs::create_dir(&dirs.vm_dir).unwrap();
+    std::fs::write(
+        dirs.vm_dir.join("vm.conf"),
+        "boot=legacy\nnetwork=none\npublic_dir=none\n",
+    )
+    .unwrap();
+
+    assert!(
+        start_vm(
+            &dirs,
+            "vm",
+            &LaunchOptions::default(),
+            Some(StartWait::CloudInit),
+            1,
+            OutputFormat::Human,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("requires a VM configured with cloud_init_iso")
+    );
+}
+
+#[test]
+fn backup_and_reset_keep_their_destructive_boundaries() {
+    let root = tempfile::tempdir().unwrap();
+    let dirs = Dirs {
+        vm_dir: root.path().join("vms"),
+        state_root: root.path().join("state"),
+    };
+    std::fs::create_dir_all(&dirs.vm_dir).unwrap();
+    std::fs::write(dirs.vm_dir.join("vm.conf"), "disk_img=\"vm/disk.qcow2\"\n").unwrap();
+    let destination = root.path().join("backup");
+    std::fs::create_dir(&destination).unwrap();
+
+    assert!(
+        backup_vm(&dirs, "vm", &destination, OutputFormat::Human)
+            .unwrap_err()
+            .to_string()
+            .contains("already exists")
+    );
+    assert!(
+        reset_cloud_vm(&dirs, "vm", false, OutputFormat::Human)
+            .unwrap_err()
+            .to_string()
+            .contains("rerun with --yes")
+    );
+}
+
+#[test]
 fn command_line_parses_gtk_clipboard_option() {
     let cli = Cli::try_parse_from(["vmctl", "start", "ubuntu", "--clipboard"]).unwrap();
     assert!(matches!(

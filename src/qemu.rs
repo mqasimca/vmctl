@@ -70,7 +70,10 @@ pub(crate) use disk::{
     create_cloud_copy, create_cloud_overlay, disk_check, disk_compact, disk_convert, disk_info,
     disk_resize, ensure_disk, validate_disk_size,
 };
-pub(crate) use guest::{disk_snapshot, guest_command, guest_exec, guest_shutdown};
+pub(crate) use guest::{
+    disk_snapshot, guest_command, guest_exec, guest_fsfreeze_freeze, guest_fsfreeze_status,
+    guest_fsfreeze_thaw, guest_fstrim, guest_shutdown,
+};
 pub(crate) use host::{default_cpu_cores, render_node};
 pub(crate) use monitor::send_monitor_command;
 pub(crate) use network::spice_address;

@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CacheStatus {
@@ -98,6 +99,158 @@ pub(super) fn cache_url(
     )
 }
 
+/// Files in the cache object store that no VM references and may be removed.
+pub(crate) fn cache_prune_candidates(
+    root: &Path,
+    referenced: &BTreeSet<String>,
+) -> Result<Vec<PathBuf>> {
+    let cache = root.join(".cache");
+    let objects = cache.join("objects");
+    match fs::symlink_metadata(&cache) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(Error::message(format!(
+                "refusing to use cache directory symlink {}",
+                cache.display()
+            )));
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(Error::message(format!(
+                "cache path is not a directory: {}",
+                cache.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(Error::io(cache.display(), error)),
+    }
+    match fs::symlink_metadata(&objects) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(Error::message(format!(
+                "refusing to use cache directory symlink {}",
+                objects.display()
+            )));
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(Error::message(format!(
+                "cache path is not a directory: {}",
+                objects.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(Error::io(objects.display(), error)),
+    }
+    let index = read_index(&cache.join("index.json"))?;
+    let mut indexed = BTreeSet::new();
+    let mut candidates = BTreeSet::new();
+
+    for entry in index.values() {
+        if let Some((path, sha256)) = cached_entry(&objects, entry)? {
+            verify_checksum(&path, Some(&format!("sha256:{sha256}")))?;
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("cache object names are validated UTF-8");
+            indexed.insert(name.to_string());
+            if !referenced.contains(name) {
+                candidates.insert(path);
+            }
+        }
+    }
+
+    let entries = match fs::read_dir(&objects) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(Error::io(objects.display(), error)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| Error::io(objects.display(), error))?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let metadata =
+            fs::symlink_metadata(&path).map_err(|error| Error::io(path.display(), error))?;
+        if name.starts_with(".vmctl-download-")
+            || name.ends_with(".lock")
+            || metadata.file_type().is_symlink()
+            || !metadata.is_file()
+        {
+            continue;
+        }
+        if !indexed.contains(name.as_ref()) && !referenced.contains(name.as_ref()) {
+            candidates.insert(path);
+        }
+    }
+    Ok(candidates.into_iter().collect())
+}
+
+pub(crate) fn cache_lock(root: &Path) -> Result<Option<crate::qemu::FileLock>> {
+    let cache = root.join(".cache");
+    match fs::symlink_metadata(&cache) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(Error::message(format!(
+            "refusing to use cache directory symlink {}",
+            cache.display()
+        ))),
+        Ok(metadata) if !metadata.is_dir() => Err(Error::message(format!(
+            "cache path is not a directory: {}",
+            cache.display()
+        ))),
+        Ok(_) => acquire_cache_lock(&cache.join("download.lock")).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(Error::io(cache.display(), error)),
+    }
+}
+
+pub(crate) fn remove_cache_candidates(
+    root: &Path,
+    candidates: &[PathBuf],
+    _lock: &crate::qemu::FileLock,
+) -> Result<()> {
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let cache = root.join(".cache");
+    let objects = cache.join("objects");
+    let mut names = BTreeSet::new();
+    for path in candidates {
+        if path.parent() != Some(objects.as_path()) {
+            return Err(Error::message(format!(
+                "refusing to prune a file outside the cache: {}",
+                path.display()
+            )));
+        }
+        let metadata =
+            fs::symlink_metadata(path).map_err(|error| Error::io(path.display(), error))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(Error::message(format!(
+                "refusing to prune a non-regular cache object: {}",
+                path.display()
+            )));
+        }
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                Error::message(format!(
+                    "cache object has no valid name: {}",
+                    path.display()
+                ))
+            })?;
+        names.insert(name.to_string());
+    }
+    for path in candidates {
+        fs::remove_file(path).map_err(|error| Error::io(path.display(), error))?;
+    }
+    let mut index = read_index(&cache.join("index.json"))?;
+    index.retain(|_, entry| {
+        !entry
+            .get("object")
+            .and_then(Value::as_str)
+            .is_some_and(|object| names.contains(object))
+    });
+    write_index(&cache.join("index.json"), &index)
+}
+
 fn cache_request(
     root: &Path,
     request: CacheRequest<'_>,
@@ -115,21 +268,9 @@ fn cache_request(
     let objects = cache.join("objects");
     ensure_cache_directory(&cache)?;
     ensure_cache_directory(&objects)?;
-    let index_path = cache.join("index.json");
-    if !refresh
-        && let Some(entry) = read_index(&index_path)?.get(url)
-        && let Some((path, sha256)) = cached_entry(&objects, entry)?
-    {
-        verify_checksum(&path, Some(&format!("sha256:{sha256}")))?;
-        return Ok(CachedImage {
-            path,
-            sha256,
-            status: CacheStatus::Hit,
-        });
-    }
-
     let lock_path = cache.join("download.lock");
     let _lock = acquire_cache_lock(&lock_path)?;
+    let index_path = cache.join("index.json");
     let mut index = read_index(&index_path)?;
     if !refresh
         && let Some(entry) = index.get(url)
@@ -438,9 +579,7 @@ fn cache_object_name(file_name: &str, kind: ImageKind, sha256: &str) -> Result<S
 fn acquire_cache_lock(path: &Path) -> Result<crate::qemu::FileLock> {
     crate::qemu::acquire_file_lock(path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::WouldBlock {
-            Error::message(
-                "another vmctl image download is using this cache; retry when it finishes",
-            )
+            Error::message("another vmctl operation is using this cache; retry when it finishes")
         } else {
             Error::io(path.display(), error)
         }
@@ -631,5 +770,102 @@ mod tests {
         .unwrap();
         assert_eq!(fs::read(victim).unwrap(), b"original");
         assert_eq!(read_index(&path).unwrap().get("safe"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn cache_prune_lists_unreferenced_indexed_and_orphan_objects_only() {
+        let root = tempdir().unwrap();
+        let objects = root.path().join(".cache/objects");
+        fs::create_dir_all(&objects).unwrap();
+        let kept = "kept.iso";
+        let stale = "stale.iso";
+        let orphan = "orphan.iso";
+        let referenced_orphan = "referenced-orphan.iso";
+        fs::write(objects.join(kept), "kept").unwrap();
+        fs::write(objects.join(stale), "stale").unwrap();
+        fs::write(objects.join(orphan), "orphan").unwrap();
+        fs::write(objects.join(referenced_orphan), "referenced orphan").unwrap();
+        fs::write(objects.join(".vmctl-download-123"), "temporary").unwrap();
+        fs::write(objects.join("download.lock"), "lock").unwrap();
+        let entries = [(kept, "kept"), (stale, "stale")]
+            .into_iter()
+            .map(|(name, contents)| {
+                (
+                    format!("https://example.invalid/{name}"),
+                    json!({
+                        "object": name,
+                        "sha256": checksum_digest(&objects.join(name), "sha256").unwrap(),
+                        "size": contents.len(),
+                    }),
+                )
+            })
+            .collect();
+        write_index(&root.path().join(".cache/index.json"), &entries).unwrap();
+
+        let candidates = cache_prune_candidates(
+            root.path(),
+            &BTreeSet::from([kept.to_string(), referenced_orphan.to_string()]),
+        )
+        .unwrap();
+        assert_eq!(candidates, vec![objects.join(orphan), objects.join(stale)]);
+        assert!(objects.join(stale).is_file());
+        assert!(objects.join(referenced_orphan).is_file());
+    }
+
+    #[test]
+    fn cache_prune_rejects_invalid_index() {
+        let root = tempdir().unwrap();
+        let objects = root.path().join(".cache/objects");
+        fs::create_dir_all(&objects).unwrap();
+        fs::write(root.path().join(".cache/index.json"), "not JSON").unwrap();
+
+        assert!(cache_prune_candidates(root.path(), &BTreeSet::new()).is_err());
+    }
+
+    #[test]
+    fn removing_pruned_cache_objects_removes_their_index_entries() {
+        let root = tempdir().unwrap();
+        let objects = root.path().join(".cache/objects");
+        fs::create_dir_all(&objects).unwrap();
+        let object = objects.join("stale.iso");
+        fs::write(&object, "stale").unwrap();
+        write_index(
+            &root.path().join(".cache/index.json"),
+            &serde_json::Map::from_iter([(
+                "https://example.invalid/stale.iso".to_string(),
+                json!({
+                    "object": "stale.iso",
+                    "sha256": checksum_digest(&object, "sha256").unwrap(),
+                }),
+            )]),
+        )
+        .unwrap();
+
+        let lock = cache_lock(root.path()).unwrap().unwrap();
+        remove_cache_candidates(root.path(), std::slice::from_ref(&object), &lock).unwrap();
+        assert!(!object.exists());
+        assert!(
+            read_index(&root.path().join(".cache/index.json"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_prune_rejects_object_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        fs::create_dir(root.path().join(".cache")).unwrap();
+        symlink(outside.path(), root.path().join(".cache/objects")).unwrap();
+
+        assert!(
+            cache_prune_candidates(root.path(), &BTreeSet::new())
+                .unwrap_err()
+                .to_string()
+                .contains("cache directory symlink")
+        );
     }
 }

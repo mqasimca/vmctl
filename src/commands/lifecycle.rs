@@ -10,9 +10,24 @@ pub(super) fn start_vm(
 ) -> Result<()> {
     let vm = load_effective_vm(dirs, name, options)?;
     let _operation_lock = acquire_vm_lock(&vm.paths)?;
-    let wait_for_ssh =
-        matches!(wait, Some(StartWait::Ssh)).then_some(Duration::from_secs(wait_timeout));
-    start_vm_loaded(&vm, output, wait_for_ssh)
+    let timeout = Duration::from_secs(wait_timeout);
+    match wait {
+        Some(StartWait::CloudInit) => {
+            if vm.config.cloud_init_iso.is_none() {
+                return Err(Error::message(
+                    "--wait cloud-init requires a VM configured with cloud_init_iso",
+                ));
+            }
+            let started = Instant::now();
+            start_vm_loaded(&vm, output, Some(timeout))?;
+            wait_for_cloud_init(&vm, timeout.saturating_sub(started.elapsed()), output)
+        }
+        _ => start_vm_loaded(
+            &vm,
+            output,
+            matches!(wait, Some(StartWait::Ssh)).then_some(timeout),
+        ),
+    }
 }
 
 pub(super) fn ssh_vm(dirs: &Dirs, name: &str, user: Option<&str>) -> Result<()> {
@@ -168,6 +183,62 @@ pub(super) fn wait_for_ssh_ready(vm: &Vm, timeout: Duration, output: OutputForma
         vm.config.name,
         vm.config.name
     )))
+}
+
+pub(super) fn wait_for_cloud_init(vm: &Vm, timeout: Duration, output: OutputFormat) -> Result<()> {
+    if vm.config.cloud_init_iso.is_none() {
+        return Err(Error::message(
+            "--wait cloud-init requires a VM configured with cloud_init_iso",
+        ));
+    }
+    if timeout.is_zero() {
+        return Err(Error::message(
+            "cloud-init did not finish before the configured wait timeout",
+        ));
+    }
+    let (host, port) = active_ssh_endpoint(vm)?;
+    if output == OutputFormat::Human {
+        eprintln!("vmctl: waiting up to {}s for cloud-init", timeout.as_secs());
+    }
+    let mut command = ProcessCommand::new("ssh");
+    command
+        .args(vm_ssh_options())
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("-o")
+        .arg("ConnectTimeout=5");
+    if let Some(user) = vm.config.ssh_user.as_deref() {
+        command.arg("-l").arg(user);
+    }
+    let mut child = command
+        .arg(host)
+        .args(["cloud-init", "status", "--wait"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| Error::command_unavailable("ssh", error))?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| Error::io("cloud-init SSH command", error))?
+        {
+            if status.success() {
+                return Ok(());
+            }
+            return Err(Error::command_failed_status("cloud-init", status));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Error::message(format!(
+                "cloud-init did not finish after {}s; the VM is still running",
+                timeout.as_secs()
+            )));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 pub(super) fn has_ssh_banner(address: SocketAddr, timeout: Duration) -> bool {

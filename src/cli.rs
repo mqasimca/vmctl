@@ -16,6 +16,8 @@ pub enum OutputFormat {
 pub enum StartWait {
     /// Wait until the guest SSH service accepts connections.
     Ssh,
+    /// Wait for cloud-init to finish through the guest's SSH service.
+    CloudInit,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -238,6 +240,30 @@ pub enum Command {
         action: SnapshotAction,
     },
 
+    /// Remove unreferenced objects from the shared image cache.
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
+    },
+
+    /// Create a stopped-VM recovery backup.
+    Backup {
+        #[arg(value_name = "VM", add = ArgValueCompleter::new(complete_vm_names))]
+        vm: String,
+        /// New directory to create for the backup.
+        #[arg(value_name = "DIRECTORY")]
+        destination: PathBuf,
+    },
+
+    /// Recreate a linked cloud VM's writable disk from its cached base image.
+    Reset {
+        #[arg(value_name = "VM", add = ArgValueCompleter::new(complete_vm_names))]
+        vm: String,
+        /// Confirm replacement of the writable disk and UEFI variables.
+        #[arg(long)]
+        yes: bool,
+    },
+
     /// Inspect and manage a VM disk image.
     Disk {
         #[arg(value_name = "VM", add = ArgValueCompleter::new(complete_vm_names))]
@@ -337,6 +363,10 @@ pub struct GetArgs {
     /// Redownload a VM image even when a verified cached copy exists.
     #[arg(long)]
     pub refresh_cache: bool,
+
+    /// GPG keyring used to verify an Ubuntu cloud checksum manifest.
+    #[arg(long, value_name = "PATH")]
+    pub manifest_keyring: Option<PathBuf>,
 
     #[arg(skip)]
     pub ssh_keys: Vec<PathBuf>,
@@ -447,6 +477,10 @@ pub struct CreateArgs {
     /// cloud-init network-config file to include in a cloud VM seed image.
     #[arg(long, value_name = "PATH")]
     pub network_config: Option<PathBuf>,
+
+    /// Raw cloud-init user-data file; cannot be combined with --ssh-key.
+    #[arg(long, value_name = "PATH")]
+    pub user_data: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -459,6 +493,16 @@ pub enum SnapshotAction {
     Delete { tag: String },
     /// Show snapshot and disk information.
     Info,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum CacheAction {
+    /// List cache objects that are no longer referenced, or remove them with --yes.
+    Prune {
+        /// Remove the listed cache objects and their index entries.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -523,6 +567,14 @@ pub enum GuestAction {
     },
     /// Query guest network interfaces and addresses.
     Ip,
+    /// Report whether guest filesystems are frozen or thawed.
+    FreezeStatus,
+    /// Sync and freeze guest filesystems for a consistent external backup.
+    Freeze,
+    /// Thaw guest filesystems after an external backup.
+    Thaw,
+    /// Ask the guest to discard filesystem blocks that are no longer in use.
+    Trim,
     /// Execute a program directly inside the guest.
     Exec {
         /// Maximum time to wait for the guest process.

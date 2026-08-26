@@ -127,6 +127,12 @@ pub(super) fn validate_operation_arguments(
             "only VM creation operations accept it",
         ));
     }
+    if args.manifest_keyring.is_some() && !matches!(operation, Operation::CreateCloudVm) {
+        return Err(Error::invalid_argument(
+            "--manifest-keyring",
+            "only cloud-image downloads accept manifest signature verification",
+        ));
+    }
     if args.refresh_cache
         && args
             .os

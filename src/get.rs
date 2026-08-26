@@ -44,6 +44,7 @@ use iso::*;
 mod cloud;
 use cloud::*;
 
+pub(crate) use cache::{cache_lock, cache_prune_candidates, remove_cache_candidates};
 pub(super) use commands::{create, run};
 
 #[cfg(test)]
