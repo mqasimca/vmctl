@@ -1,5 +1,3 @@
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::Path;
 
 use super::*;
@@ -132,7 +130,10 @@ fn write_clone_config(
 
     values.insert(
         "disk_img".to_string(),
-        relative_value(config_path.parent().unwrap_or(Path::new(".")), disk),
+        crate::get::relative_value(
+            config_path.parent().unwrap_or(Path::new(".")),
+            disk,
+        ),
     );
     for key in [
         "iso",
@@ -148,7 +149,10 @@ fn write_clone_config(
     if let Some(seed) = seed {
         values.insert(
             "cloud_init_iso".to_string(),
-            relative_value(config_path.parent().unwrap_or(Path::new("")), seed),
+            crate::get::relative_value(
+                config_path.parent().unwrap_or(Path::new("")),
+                seed,
+            ),
         );
     } else {
         values.remove("cloud_init_iso");
@@ -164,34 +168,10 @@ fn write_clone_config(
 
     let mut lines = Vec::new();
     for (key, value) in &values {
-        let value = value.replace('\\', "\\\\").replace('"', "\\\"");
+        let value = crate::get::config_value(value);
         lines.push(format!("{key}=\"{value}\""));
     }
     lines.sort();
     let contents = format!("{}\n", lines.join("\n"));
-    write_new_config(config_path, &contents)
-}
-
-fn relative_value(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
-}
-
-fn write_new_config(path: &Path, contents: &str) -> Result<PathBuf> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| Error::io(parent.display(), error))?;
-    }
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|error| Error::io(path.display(), error))?;
-    if let Err(error) = file.write_all(contents.as_bytes()) {
-        drop(file);
-        let _ = fs::remove_file(path);
-        return Err(Error::io(path.display(), error));
-    }
-    Ok(path.to_path_buf())
+    crate::get::write_new_config(config_path, &contents)
 }

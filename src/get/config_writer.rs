@@ -44,11 +44,7 @@ pub(super) fn write_vm_config(
 ) -> Result<PathBuf> {
     let name = validate_vm_name(name)?;
     let config_path = root.join(format!("{name}.conf"));
-    let image = image
-        .strip_prefix(root)
-        .unwrap_or(image)
-        .to_string_lossy()
-        .replace('\\', "/");
+    let image = relative_value(root, image);
     let image_type = image_kind(&image);
     let guest_os = guest_os(os, release);
     let disk_size = disk_size(os, edition);
@@ -121,12 +117,6 @@ pub(super) fn write_cloud_vm_config(
 ) -> Result<PathBuf> {
     let name = validate_vm_name(name)?;
     let config_path = root.join(format!("{name}.conf"));
-    let relative = |path: &Path| {
-        path.strip_prefix(root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/")
-    };
     let mut lines = vec![
         format!(
             "guest_os=\"{}\"",
@@ -136,16 +126,19 @@ pub(super) fn write_cloud_vm_config(
             "arch=\"{}\"",
             config_value(qemu_architecture(cloud.architecture))
         ),
-        format!("disk_img=\"{}\"", config_value(&relative(cloud.disk))),
+        format!("disk_img=\"{}\"", config_value(&relative_value(root, cloud.disk))),
     ];
     if let Some(base) = cloud.base {
         lines.push(format!(
             "cloud_base_img=\"{}\"",
-            config_value(&relative(base))
+            config_value(&relative_value(root, base))
         ));
     }
     lines.extend([
-        format!("cloud_init_iso=\"{}\"", config_value(&relative(cloud.seed))),
+        format!(
+            "cloud_init_iso=\"{}\"",
+            config_value(&relative_value(root, cloud.seed))
+        ),
         format!("ssh_user=\"{}\"", config_value(cloud.ssh_user)),
     ]);
     if let Some(disk_size) = resources.disk_size {
@@ -161,7 +154,14 @@ pub(super) fn write_cloud_vm_config(
     write_new_config(&config_path, &contents)
 }
 
-fn write_new_config(path: &Path, contents: &str) -> Result<PathBuf> {
+pub(crate) fn relative_value(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+pub(crate) fn write_new_config(path: &Path, contents: &str) -> Result<PathBuf> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| Error::io(parent.display(), error))?;
     }
@@ -399,7 +399,7 @@ pub(super) fn required_arg<'a>(value: Option<&'a str>, name: &str) -> Result<&'a
     value.ok_or_else(|| Error::message(format!("{name} is required")))
 }
 
-pub(super) fn config_value(value: &str) -> String {
+pub(crate) fn config_value(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 

@@ -169,16 +169,15 @@ pub(super) fn curl_request(
 pub(super) fn convert_recovery_image(source: &Path, destination: &Path) -> Result<()> {
     let (temporary, file) = stage_new_file(destination)?;
     drop(file);
-    let status = Command::new("qemu-img")
-        .arg("convert")
-        .arg(source)
-        .args(["-O", "raw"])
-        .arg(&temporary)
-        .status()
-        .map_err(|error| Error::command_unavailable("qemu-img", error));
-    let result = match status {
-        Ok(status) if status.success() => commit_new_file(&temporary, destination),
-        Ok(status) => Err(Error::command_failed_status("qemu-img convert", status)),
+    let result = match crate::qemu::run_qemu_img([
+        "convert".to_string(),
+        source.to_string_lossy().into_owned(),
+        "-O".to_string(),
+        "raw".to_string(),
+        temporary.to_string_lossy().into_owned(),
+    ]) {
+        Ok(output) if output.status.success() => commit_new_file(&temporary, destination),
+        Ok(output) => Err(crate::qemu::qemu_img_failure("convert", output)),
         Err(error) => Err(error),
     };
     if result.is_err() {

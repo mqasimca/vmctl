@@ -933,9 +933,9 @@ fn command_lookup_requires_an_executable_file() {
     let root = tempfile::tempdir().unwrap();
     let command = root.path().join("helper");
     fs::write(&command, "#!/bin/sh\n").unwrap();
-    assert!(!is_executable_file(&command));
+    assert!(!crate::util::is_executable_file(&command));
     fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
-    assert!(is_executable_file(&command));
+    assert!(crate::util::is_executable_file(&command));
 }
 
 #[test]

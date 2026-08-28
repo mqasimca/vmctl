@@ -161,14 +161,7 @@ pub(super) fn process_allowed_cpu_spec() -> Option<String> {
         .or_else(|| fs::read_to_string("/sys/devices/system/cpu/online").ok())
 }
 
-pub(super) fn command_available(command: &str) -> bool {
-    ProcessCommand::new(command)
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-}
+pub(super) use crate::util::command_available;
 
 pub(super) fn command_version(command: &str) -> Option<String> {
     let output = ProcessCommand::new(command)

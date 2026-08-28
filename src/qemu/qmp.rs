@@ -45,6 +45,72 @@ pub(super) fn execute_qmp(
     }
 }
 
+pub(super) struct QmpConnection {
+    stream: IpcStream,
+    reader: BufReader<IpcStream>,
+    deadline: Instant,
+    greeting: Value,
+}
+
+impl QmpConnection {
+    pub(super) fn connect(paths: &VmPaths) -> Result<Self> {
+        Self::connect_endpoint(
+            &qmp_endpoint_for_paths(paths)?,
+            QMP_TIMEOUT,
+            Some(QMP_TIMEOUT),
+        )
+    }
+
+    pub(super) fn connect_endpoint(
+        endpoint: &IpcEndpoint,
+        read_timeout: Duration,
+        write_timeout: Option<Duration>,
+    ) -> Result<Self> {
+        let deadline = qmp_deadline()?;
+        let stream = connect_endpoint_retry(endpoint, "QMP")?;
+        stream
+            .set_read_timeout(Some(read_timeout))
+            .map_err(|error| Error::io(endpoint.display(), error))?;
+        if let Some(write_timeout) = write_timeout {
+            stream
+                .set_write_timeout(Some(write_timeout))
+                .map_err(|error| Error::io(endpoint.display(), error))?;
+        }
+        let mut reader = BufReader::new(
+            stream
+                .try_clone()
+                .map_err(|error| Error::io(endpoint.display(), error))?,
+        );
+        let greeting = read_qmp_greeting_until(&mut reader, deadline)?;
+        Ok(Self {
+            stream,
+            reader,
+            deadline,
+            greeting,
+        })
+    }
+
+    pub(super) fn greeting(&self) -> &Value {
+        &self.greeting
+    }
+
+    pub(super) fn execute(
+        &mut self,
+        command: &str,
+        id: &str,
+        arguments: Option<Value>,
+    ) -> Result<Value> {
+        execute_qmp(
+            &mut self.stream,
+            &mut self.reader,
+            command,
+            id,
+            arguments,
+            self.deadline,
+        )
+    }
+}
+
 pub(super) const QMP_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(super) fn qmp_deadline() -> Result<Instant> {

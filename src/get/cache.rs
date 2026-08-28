@@ -106,13 +106,8 @@ pub(crate) fn cache_prune_candidates(
 ) -> Result<Vec<PathBuf>> {
     let cache = root.join(".cache");
     let objects = cache.join("objects");
+    crate::util::ensure_not_symlink(&cache, "use cache directory")?;
     match fs::symlink_metadata(&cache) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(Error::message(format!(
-                "refusing to use cache directory symlink {}",
-                cache.display()
-            )));
-        }
         Ok(metadata) if !metadata.is_dir() => {
             return Err(Error::message(format!(
                 "cache path is not a directory: {}",
@@ -123,13 +118,8 @@ pub(crate) fn cache_prune_candidates(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(Error::io(cache.display(), error)),
     }
+    crate::util::ensure_not_symlink(&objects, "use cache directory")?;
     match fs::symlink_metadata(&objects) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(Error::message(format!(
-                "refusing to use cache directory symlink {}",
-                objects.display()
-            )));
-        }
         Ok(metadata) if !metadata.is_dir() => {
             return Err(Error::message(format!(
                 "cache path is not a directory: {}",
@@ -186,11 +176,8 @@ pub(crate) fn cache_prune_candidates(
 
 pub(crate) fn cache_lock(root: &Path) -> Result<Option<crate::qemu::FileLock>> {
     let cache = root.join(".cache");
+    crate::util::ensure_not_symlink(&cache, "use cache directory")?;
     match fs::symlink_metadata(&cache) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(Error::message(format!(
-            "refusing to use cache directory symlink {}",
-            cache.display()
-        ))),
         Ok(metadata) if !metadata.is_dir() => Err(Error::message(format!(
             "cache path is not a directory: {}",
             cache.display()
@@ -428,15 +415,7 @@ pub(super) fn cached_source(root: &Path, object: &str) -> Result<CachedSource> {
 }
 
 fn read_index(path: &Path) -> Result<serde_json::Map<String, Value>> {
-    if fs::symlink_metadata(path)
-        .ok()
-        .is_some_and(|metadata| metadata.file_type().is_symlink())
-    {
-        return Err(Error::message(format!(
-            "refusing to read cache index symlink {}",
-            path.display()
-        )));
-    }
+    crate::util::ensure_not_symlink(path, "read cache index")?;
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
@@ -458,26 +437,15 @@ fn read_index(path: &Path) -> Result<serde_json::Map<String, Value>> {
 }
 
 fn write_index(path: &Path, entries: &serde_json::Map<String, Value>) -> Result<()> {
-    if fs::symlink_metadata(path)
-        .ok()
-        .is_some_and(|metadata| metadata.file_type().is_symlink())
-    {
-        return Err(Error::message(format!(
-            "refusing to replace cache index symlink {}",
-            path.display()
-        )));
-    }
+    crate::util::ensure_not_symlink(path, "replace cache index")?;
     let contents = serde_json::to_vec_pretty(&json!({"version": 1, "entries": entries}))
         .expect("JSON values are serializable");
     crate::qemu::write_atomic_file(path, &contents)
 }
 
 fn ensure_cache_directory(path: &Path) -> Result<()> {
+    crate::util::ensure_not_symlink(path, "use cache directory")?;
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(Error::message(format!(
-            "refusing to use cache directory symlink {}",
-            path.display()
-        ))),
         Ok(metadata) if metadata.is_dir() => Ok(()),
         Ok(_) => Err(Error::message(format!(
             "cache path is not a directory: {}",

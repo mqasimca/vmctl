@@ -125,140 +125,38 @@ pub fn remove_runtime_sockets(paths: &VmPaths) {
 }
 
 pub fn shutdown_via_qmp(paths: &VmPaths) -> Result<()> {
-    let endpoint = qmp_endpoint_for_paths(paths)?;
-    let deadline = qmp_deadline()?;
-    let mut stream = connect_endpoint_retry(&endpoint, "QMP")?;
-    stream
-        .set_read_timeout(Some(QMP_TIMEOUT))
-        .map_err(|error| Error::io(endpoint.display(), error))?;
-    stream
-        .set_write_timeout(Some(QMP_TIMEOUT))
-        .map_err(|error| Error::io(endpoint.display(), error))?;
-    let mut reader = BufReader::new(
-        stream
-            .try_clone()
-            .map_err(|error| Error::io(endpoint.display(), error))?,
-    );
-
-    read_qmp_greeting_until(&mut reader, deadline)?;
-    execute_qmp(
-        &mut stream,
-        &mut reader,
-        "qmp_capabilities",
-        "vmctl-capabilities",
-        None,
-        deadline,
-    )?;
-    execute_qmp(
-        &mut stream,
-        &mut reader,
-        "system_powerdown",
-        "vmctl-shutdown",
-        None,
-        deadline,
-    )?;
+    let mut connection = QmpConnection::connect(paths)?;
+    connection.execute("qmp_capabilities", "vmctl-capabilities", None)?;
+    connection.execute("system_powerdown", "vmctl-shutdown", None)?;
     Ok(())
 }
 
 pub(crate) fn qmp_ping(paths: &VmPaths) -> Result<Value> {
-    let endpoint = qmp_endpoint_for_paths(paths)?;
-    let deadline = qmp_deadline()?;
-    let stream = connect_endpoint_retry(&endpoint, "QMP")?;
-    stream
-        .set_read_timeout(Some(QMP_TIMEOUT))
-        .map_err(|error| Error::io(endpoint.display(), error))?;
-    let mut reader = BufReader::new(
-        stream
-            .try_clone()
-            .map_err(|error| Error::io(endpoint.display(), error))?,
-    );
-    let greeting = read_qmp_greeting_until(&mut reader, deadline)?;
-    Ok(greeting)
+    Ok(QmpConnection::connect(paths)?.greeting().clone())
 }
 
 pub(crate) fn qmp_status(paths: &VmPaths) -> Result<String> {
-    let endpoint = qmp_endpoint_for_paths(paths)?;
-    let deadline = qmp_deadline()?;
-    let mut stream = connect_endpoint_retry(&endpoint, "QMP")?;
-    stream
-        .set_read_timeout(Some(QMP_TIMEOUT))
-        .map_err(|error| Error::io(endpoint.display(), error))?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(2)))
-        .map_err(|error| Error::io(endpoint.display(), error))?;
-    let mut reader = BufReader::new(
-        stream
-            .try_clone()
-            .map_err(|error| Error::io(endpoint.display(), error))?,
-    );
-    read_qmp_greeting_until(&mut reader, deadline)?;
-    execute_qmp(
-        &mut stream,
-        &mut reader,
-        "qmp_capabilities",
-        "vmctl-status-capabilities",
-        None,
-        deadline,
+    let mut connection = QmpConnection::connect_endpoint(
+        &qmp_endpoint_for_paths(paths)?,
+        QMP_TIMEOUT,
+        Some(Duration::from_secs(2)),
     )?;
-    execute_qmp(
-        &mut stream,
-        &mut reader,
-        "query-status",
-        "vmctl-status",
-        None,
-        deadline,
-    )?
-    .get("status")
-    .and_then(Value::as_str)
-    .map(str::to_string)
-    .ok_or_else(|| Error::Qmp("query-status returned no status".to_string()))
+    connection.execute("qmp_capabilities", "vmctl-status-capabilities", None)?;
+    connection
+        .execute("query-status", "vmctl-status", None)?
+        .get("status")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| Error::Qmp("query-status returned no status".to_string()))
 }
 
 pub(crate) fn qmp_live_resources(paths: &VmPaths) -> Result<Value> {
-    let endpoint = qmp_endpoint_for_paths(paths)?;
-    let deadline = qmp_deadline()?;
-    let mut stream = connect_endpoint_retry(&endpoint, "QMP")?;
-    stream
-        .set_read_timeout(Some(QMP_TIMEOUT))
-        .map_err(|error| Error::io(endpoint.display(), error))?;
-    let mut reader = BufReader::new(
-        stream
-            .try_clone()
-            .map_err(|error| Error::io(endpoint.display(), error))?,
-    );
-    read_qmp_greeting_until(&mut reader, deadline)?;
-    execute_qmp(
-        &mut stream,
-        &mut reader,
-        "qmp_capabilities",
-        "vmctl-live-capabilities",
-        None,
-        deadline,
-    )?;
-    let cpus = execute_qmp(
-        &mut stream,
-        &mut reader,
-        "query-cpus-fast",
-        "vmctl-live-cpus",
-        None,
-        deadline,
-    )?;
-    let memory = execute_qmp(
-        &mut stream,
-        &mut reader,
-        "query-memory-size-summary",
-        "vmctl-live-memory",
-        None,
-        deadline,
-    )?;
-    let block = execute_qmp(
-        &mut stream,
-        &mut reader,
-        "query-block",
-        "vmctl-live-block",
-        None,
-        deadline,
-    )?;
+    let mut connection =
+        QmpConnection::connect_endpoint(&qmp_endpoint_for_paths(paths)?, QMP_TIMEOUT, None)?;
+    connection.execute("qmp_capabilities", "vmctl-live-capabilities", None)?;
+    let cpus = connection.execute("query-cpus-fast", "vmctl-live-cpus", None)?;
+    let memory = connection.execute("query-memory-size-summary", "vmctl-live-memory", None)?;
+    let block = connection.execute("query-block", "vmctl-live-block", None)?;
     Ok(json!({"cpus": cpus, "memory": memory, "block": block}))
 }
 

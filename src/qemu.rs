@@ -67,7 +67,8 @@ pub(crate) use capabilities::{qemu_capability_report, virtiofsd_available};
 pub(crate) use devices::{configured_bridge, virtiofs_requested};
 pub(crate) use disk::{
     create_cloud_copy, create_cloud_overlay, disk_check, disk_compact, disk_convert, disk_info,
-    disk_resize, ensure_disk, require_disk_file, validate_disk_size,
+    disk_resize, ensure_disk, qemu_img_failure, require_disk_file, run_qemu_img,
+    validate_disk_size,
 };
 pub(crate) use guest::{
     disk_snapshot, guest_command, guest_exec, guest_fsfreeze_freeze, guest_fsfreeze_status,

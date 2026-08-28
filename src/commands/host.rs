@@ -13,16 +13,7 @@ pub(super) fn configure_ignore_msrs(output: OutputFormat, report: bool) -> Resul
         ));
     }
     let path = Path::new("/etc/modprobe.d/vmctl-kvm.conf");
-    if path
-        .symlink_metadata()
-        .ok()
-        .is_some_and(|metadata| metadata.file_type().is_symlink())
-    {
-        return Err(Error::message(format!(
-            "refusing to write through symlink {}",
-            path.display()
-        )));
-    }
+    crate::util::ensure_not_symlink(path, "write through")?;
     let existing = match fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -139,50 +130,7 @@ pub(super) fn write_host_file(path: &Path, contents: &str) -> Result<bool> {
     }
 }
 
-pub(super) fn find_command(command: &str) -> Option<String> {
-    let path = env::var_os("PATH")?;
-    #[cfg(windows)]
-    let names = {
-        let mut names = vec![command.to_string()];
-        if Path::new(command).extension().is_none() {
-            let extensions =
-                env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
-            names.extend(
-                extensions
-                    .split(';')
-                    .filter(|extension| !extension.is_empty())
-                    .map(|extension| format!("{command}{extension}")),
-            );
-        }
-        names
-    };
-    #[cfg(not(windows))]
-    let names = [command.to_string()];
-    env::split_paths(&path).find_map(|directory| {
-        names
-            .iter()
-            .map(|name| directory.join(name))
-            .find(|candidate| is_executable_file(candidate))
-            .map(|candidate| candidate.to_string_lossy().into_owned())
-    })
-}
-
-pub(super) fn is_executable_file(path: &Path) -> bool {
-    let Ok(metadata) = fs::metadata(path) else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
-}
+pub(super) use crate::util::find_executable as find_command;
 
 #[cfg(test)]
 mod tests {

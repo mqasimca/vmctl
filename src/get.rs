@@ -47,7 +47,9 @@ use cloud::*;
 pub(crate) use cache::{cache_lock, cache_prune_candidates, remove_cache_candidates};
 pub(crate) use cloud::{create_cloud_seed, validate_hostname};
 pub(super) use commands::{create, run};
-pub(crate) use config_writer::validate_vm_name;
+pub(crate) use config_writer::{
+    config_value, relative_value, validate_vm_name, write_new_config,
+};
 
 #[cfg(test)]
 mod tests;

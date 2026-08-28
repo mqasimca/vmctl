@@ -85,13 +85,7 @@ pub(super) fn relative_firmware_pairs(
 }
 
 fn reject_unsafe_firmware_vars(path: &Path) -> Result<()> {
-    if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
-        return Err(Error::message(format!(
-            "refusing to use UEFI variables symlink {}",
-            path.display()
-        )));
-    }
-    Ok(())
+    crate::util::ensure_not_symlink(path, "use UEFI variables")
 }
 
 pub(super) fn firmware_paths(vm: &Vm, prepare: bool) -> Result<(PathBuf, PathBuf)> {

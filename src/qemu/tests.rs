@@ -595,9 +595,9 @@ fn executable_lookup_rejects_non_executable_files() {
     let root = tempdir().unwrap();
     let command = root.path().join("qemu-system-test");
     fs::write(&command, "#!/bin/sh\n").unwrap();
-    assert!(!is_executable_file(&command));
+    assert!(!crate::util::is_executable_file(&command));
     fs::set_permissions(&command, fs::Permissions::from_mode(0o755)).unwrap();
-    assert!(is_executable_file(&command));
+    assert!(crate::util::is_executable_file(&command));
 }
 
 #[test]

@@ -252,7 +252,7 @@ fn prepare_config_settings(path: &Path, updates: &[(&str, String)]) -> Result<(F
                 "values cannot contain newlines",
             ));
         }
-        let value = value.replace('\\', "\\\\").replace('"', "\\\"");
+        let value = crate::get::config_value(value);
         settings.push_str(&format!("{key}=\"{value}\"\n"));
     }
     let mut file = crate::config::open_config_for_append(path)?;
@@ -490,12 +490,7 @@ pub(super) fn delete_vm(dirs: &Dirs, name: &str, yes: bool, output: OutputFormat
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(&vm.config.name);
-    if fs::symlink_metadata(&data_dir).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
-        return Err(Error::message(format!(
-            "refusing to remove VM data symlink {}",
-            data_dir.display()
-        )));
-    }
+    crate::util::ensure_not_symlink(&data_dir, "remove VM data")?;
     remove_if_present(&vm.config.disk_img)?;
     for path in persistent_efi_vars(&vm) {
         remove_if_present(&path)?;
@@ -638,13 +633,8 @@ pub(super) fn reset_cloud_vm(
             previous.display()
         )));
     }
+    crate::util::ensure_not_symlink(&vm.config.disk_img, "reset disk")?;
     let had_disk = match fs::symlink_metadata(&vm.config.disk_img) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(Error::message(format!(
-                "refusing to reset disk symlink {}",
-                vm.config.disk_img.display()
-            )));
-        }
         Ok(metadata) if !metadata.is_file() => {
             return Err(Error::message(format!(
                 "cloud disk is not a regular file: {}",

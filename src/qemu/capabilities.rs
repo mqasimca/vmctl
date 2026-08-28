@@ -36,67 +36,7 @@ pub(super) fn qemu_supports_vdagent(binary: &str) -> bool {
         .is_some_and(|output| output.contains("qemu-vdagent"))
 }
 
-pub(super) fn command_available(command: &str) -> bool {
-    find_executable(command)
-        .map(Command::new)
-        .unwrap_or_else(|| Command::new(command))
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
-pub(super) fn find_executable(command: &str) -> Option<String> {
-    let path = env::var_os("PATH")?;
-    let names = executable_names(command);
-    env::split_paths(&path).find_map(|directory| {
-        names
-            .iter()
-            .map(|name| directory.join(name))
-            .find(|candidate| is_executable_file(candidate))
-            .map(|candidate| candidate.to_string_lossy().into_owned())
-    })
-}
-
-pub(super) fn is_executable_file(path: &Path) -> bool {
-    let Ok(metadata) = fs::metadata(path) else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
-}
-
-pub(super) fn executable_names(command: &str) -> Vec<String> {
-    #[cfg(windows)]
-    {
-        let mut names = vec![command.to_string()];
-        if Path::new(command).extension().is_none() {
-            let extensions =
-                env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
-            names.extend(
-                extensions
-                    .split(';')
-                    .filter(|extension| !extension.is_empty())
-                    .map(|extension| format!("{command}{extension}")),
-            );
-        }
-        names
-    }
-    #[cfg(not(windows))]
-    {
-        vec![command.to_string()]
-    }
-}
+pub(super) use crate::util::{command_available, find_executable};
 
 pub(super) fn find_virtiofsd() -> Option<String> {
     find_executable("virtiofsd").or_else(|| {

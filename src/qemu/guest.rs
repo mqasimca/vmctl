@@ -570,15 +570,9 @@ pub(crate) fn disk_snapshot(vm: &Vm, action: &str, tag: Option<&str>) -> Result<
         args.push(action.to_string());
     }
     args.push(vm.config.disk_img.to_string_lossy().into_owned());
-    let output = Command::new("qemu-img")
-        .args(args)
-        .output()
-        .map_err(|error| Error::command_unavailable("qemu-img", error))?;
+    let output = run_qemu_img(&args)?;
     if !output.status.success() {
-        return Err(Error::command_failed_status(
-            "qemu-img snapshot",
-            output.status,
-        ));
+        return Err(qemu_img_failure("snapshot", output));
     }
     let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
     Ok(if text.is_empty() {

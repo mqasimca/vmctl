@@ -1,22 +1,13 @@
 use super::*;
 
 pub fn ensure_disk(vm: &Vm) -> Result<()> {
-    if fs::symlink_metadata(&vm.config.disk_img)
-        .is_ok_and(|metadata| metadata.file_type().is_symlink())
-    {
-        return Err(Error::message(format!(
-            "refusing to use disk symlink {}",
-            vm.config.disk_img.display()
-        )));
-    }
+    crate::util::ensure_not_symlink(&vm.config.disk_img, "use disk")?;
     if vm.config.disk_img.exists() {
-        let status = Command::new("qemu-img")
-            .args(["info", vm.config.disk_img.to_string_lossy().as_ref()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map_err(|error| Error::command_unavailable("qemu-img", error))?;
-        if !status.success() {
+        let output = run_qemu_img([
+            "info".to_string(),
+            vm.config.disk_img.to_string_lossy().into_owned(),
+        ])?;
+        if !output.status.success() {
             return Err(Error::message(format!(
                 "qemu-img could not read {}",
                 vm.config.disk_img.display()
@@ -50,8 +41,11 @@ pub fn ensure_disk(vm: &Vm) -> Result<()> {
     if let Some(parent) = vm.config.disk_img.parent() {
         fs::create_dir_all(parent).map_err(|error| Error::io(parent.display(), error))?;
     }
-    let mut command = Command::new("qemu-img");
-    command.args(["create", "-f", &vm.config.disk_format]);
+    let mut args = vec![
+        "create".to_string(),
+        "-f".to_string(),
+        vm.config.disk_format.clone(),
+    ];
     let options = match vm.config.disk_format.as_str() {
         "qcow2" => format!(
             "lazy_refcounts=on,preallocation={},nocow=on",
@@ -61,15 +55,13 @@ pub fn ensure_disk(vm: &Vm) -> Result<()> {
         _ => String::new(),
     };
     if !options.is_empty() {
-        command.args(["-o", options.as_str()]);
+        args.extend(["-o".to_string(), options]);
     }
-    let output = command
-        .args([
-            vm.config.disk_img.to_string_lossy().as_ref(),
-            &vm.config.disk_size,
-        ])
-        .output()
-        .map_err(|error| Error::command_unavailable("qemu-img", error))?;
+    args.extend([
+        vm.config.disk_img.to_string_lossy().into_owned(),
+        vm.config.disk_size.clone(),
+    ]);
+    let output = run_qemu_img(&args)?;
     if !output.status.success() {
         return Err(qemu_img_failure("create", output));
     }
@@ -99,11 +91,17 @@ pub(crate) fn create_cloud_overlay(base: &Path, overlay: &Path, backing: &str) -
             temporary.display()
         )));
     }
-    let output = Command::new("qemu-img")
-        .args(["create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", backing])
-        .arg(&temporary)
-        .output()
-        .map_err(|error| Error::command_unavailable("qemu-img", error))?;
+    let output = run_qemu_img([
+        "create".to_string(),
+        "-q".to_string(),
+        "-f".to_string(),
+        "qcow2".to_string(),
+        "-F".to_string(),
+        "qcow2".to_string(),
+        "-b".to_string(),
+        backing.to_string(),
+        temporary.to_string_lossy().into_owned(),
+    ])?;
     if !output.status.success() {
         let _ = fs::remove_file(&temporary);
         return Err(qemu_img_failure("create", output));
@@ -130,12 +128,16 @@ pub(crate) fn create_cloud_copy(base: &Path, disk: &Path) -> Result<()> {
             temporary.display()
         )));
     }
-    let output = Command::new("qemu-img")
-        .args(["convert", "-q", "-f", "qcow2", "-O", "qcow2"])
-        .arg(base)
-        .arg(&temporary)
-        .output()
-        .map_err(|error| Error::command_unavailable("qemu-img", error))?;
+    let output = run_qemu_img([
+        "convert".to_string(),
+        "-q".to_string(),
+        "-f".to_string(),
+        "qcow2".to_string(),
+        "-O".to_string(),
+        "qcow2".to_string(),
+        base.to_string_lossy().into_owned(),
+        temporary.to_string_lossy().into_owned(),
+    ])?;
     if !output.status.success() {
         let _ = fs::remove_file(&temporary);
         return Err(qemu_img_failure("convert", output));
@@ -315,12 +317,7 @@ pub(crate) fn require_disk_file(path: &Path) -> Result<()> {
             Error::io(path.display(), error)
         }
     })?;
-    if metadata.file_type().is_symlink() {
-        return Err(Error::message(format!(
-            "refusing to use disk symlink {}",
-            path.display()
-        )));
-    }
+    crate::util::ensure_not_symlink(path, "use disk")?;
     if !metadata.file_type().is_file() {
         return Err(Error::message(format!(
             "disk {} does not exist or is not a regular file",
@@ -360,12 +357,7 @@ pub(super) fn prepare_conversion_destination(path: &Path, force: bool) -> Result
     let Ok(metadata) = fs::symlink_metadata(path) else {
         return Ok(());
     };
-    if metadata.file_type().is_symlink() {
-        return Err(Error::message(format!(
-            "refusing to write through output symlink {}",
-            path.display()
-        )));
-    }
+    crate::util::ensure_not_symlink(path, "write through output")?;
     if !metadata.file_type().is_file() {
         return Err(Error::message(format!(
             "conversion output is not a regular file: {}",
@@ -391,14 +383,18 @@ pub(super) fn same_path(left: &Path, right: &Path) -> bool {
     }
 }
 
-pub(super) fn run_qemu_img(args: &[String]) -> Result<Output> {
+pub(crate) fn run_qemu_img<I, S>(args: I) -> Result<Output>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
     Command::new("qemu-img")
         .args(args)
         .output()
         .map_err(|error| Error::command_unavailable("qemu-img", error))
 }
 
-pub(super) fn qemu_img_failure(operation: &str, output: Output) -> Error {
+pub(crate) fn qemu_img_failure(operation: &str, output: Output) -> Error {
     let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if detail.is_empty() {
         Error::command_failed_status(&format!("qemu-img {operation}"), output.status)

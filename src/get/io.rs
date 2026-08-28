@@ -210,14 +210,7 @@ pub(super) fn checksum_digest(path: &Path, algorithm: &str) -> Result<String> {
         .to_ascii_lowercase())
 }
 
-pub(super) fn command_exists(command: &str) -> bool {
-    Command::new(command)
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-}
+pub(super) use crate::util::command_available as command_exists;
 
 pub(super) fn curl_security_args(insecure: bool) -> &'static [&'static str] {
     if insecure { &["--insecure"] } else { &[] }
@@ -259,15 +252,7 @@ pub(super) fn url_available_with_headers(
 }
 
 pub(super) fn prepare_image(path: &Path) -> Result<PathBuf> {
-    if fs::symlink_metadata(path)
-        .ok()
-        .is_some_and(|metadata| metadata.file_type().is_symlink())
-    {
-        return Err(Error::message(format!(
-            "refusing to process symlink {}",
-            path.display()
-        )));
-    }
+    crate::util::ensure_not_symlink(path, "process")?;
     let extension = path
         .extension()
         .and_then(|value| value.to_str())
@@ -281,15 +266,7 @@ pub(super) fn prepare_image(path: &Path) -> Result<PathBuf> {
         .ok_or_else(|| Error::message("archive has no parent directory"))?;
     if matches!(extension.as_str(), "gz" | "bz2" | "xz") {
         let output = path.with_extension("");
-        if fs::symlink_metadata(&output)
-            .ok()
-            .is_some_and(|metadata| metadata.file_type().is_symlink())
-        {
-            return Err(Error::message(format!(
-                "refusing to decompress through symlink {}",
-                output.display()
-            )));
-        }
+        crate::util::ensure_not_symlink(&output, "decompress through")?;
         let command = match extension.as_str() {
             "gz" => "gzip",
             "bz2" => "bzip2",
@@ -375,13 +352,8 @@ pub(super) fn extract_archive(path: &Path, extract_dir: &Path, extension: &str) 
         .file_name()
         .ok_or_else(|| Error::message("archive entry has no file name"))?;
     let destination = parent.join(file_name);
+    crate::util::ensure_not_symlink(&destination, "replace")?;
     if let Ok(metadata) = fs::symlink_metadata(&destination) {
-        if metadata.file_type().is_symlink() {
-            return Err(Error::message(format!(
-                "refusing to replace symlink {}",
-                destination.display()
-            )));
-        }
         if metadata.is_file() {
             return Ok(destination);
         }

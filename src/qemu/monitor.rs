@@ -165,36 +165,12 @@ pub(super) fn read_monitor_response(
 }
 
 pub(super) fn send_qmp_human_monitor_command(vm: &Vm, command: &str) -> Result<String> {
-    let endpoint = qmp_endpoint_for_paths(&vm.paths)?;
-    let deadline = qmp_deadline()?;
-    let mut stream = connect_endpoint_retry(&endpoint, "QMP")?;
-    stream
-        .set_read_timeout(Some(QMP_TIMEOUT))
-        .map_err(|error| Error::io(endpoint.display(), error))?;
-    stream
-        .set_write_timeout(Some(QMP_TIMEOUT))
-        .map_err(|error| Error::io(endpoint.display(), error))?;
-    let mut reader = BufReader::new(
-        stream
-            .try_clone()
-            .map_err(|error| Error::io(endpoint.display(), error))?,
-    );
-    read_qmp_greeting_until(&mut reader, deadline)?;
-    execute_qmp(
-        &mut stream,
-        &mut reader,
-        "qmp_capabilities",
-        "vmctl-monitor-capabilities",
-        None,
-        deadline,
-    )?;
-    let response = execute_qmp(
-        &mut stream,
-        &mut reader,
+    let mut connection = QmpConnection::connect(&vm.paths)?;
+    connection.execute("qmp_capabilities", "vmctl-monitor-capabilities", None)?;
+    let response = connection.execute(
         "human-monitor-command",
         "vmctl-monitor-command",
         Some(json!({"command-line": command})),
-        deadline,
     )?;
     response
         .as_str()

@@ -401,15 +401,7 @@ pub(super) fn create_unattended_iso(target_dir: &Path, insecure: bool) -> Result
     let source_dir = target_dir.join("unattended");
     fs::create_dir_all(&source_dir).map_err(|error| Error::io(source_dir.display(), error))?;
     let xml = source_dir.join("autounattend.xml");
-    if fs::symlink_metadata(&xml)
-        .ok()
-        .is_some_and(|metadata| metadata.file_type().is_symlink())
-    {
-        return Err(Error::message(format!(
-            "refusing to write through symlink {}",
-            xml.display()
-        )));
-    }
+    crate::util::ensure_not_symlink(&xml, "write through")?;
     fs::write(&xml, WINDOWS_UNATTENDED_XML).map_err(|error| Error::io(xml.display(), error))?;
     for (url, file) in [
         (
@@ -424,15 +416,7 @@ pub(super) fn create_unattended_iso(target_dir: &Path, insecure: bool) -> Result
         download_file(url, &source_dir.join(file), insecure)?;
     }
     let destination = target_dir.join("unattended.iso");
-    if fs::symlink_metadata(&destination)
-        .ok()
-        .is_some_and(|metadata| metadata.file_type().is_symlink())
-    {
-        return Err(Error::message(format!(
-            "refusing to write through symlink {}",
-            destination.display()
-        )));
-    }
+    crate::util::ensure_not_symlink(&destination, "write through")?;
     let result = create_iso(&source_dir, &destination, None);
     let _ = fs::remove_dir_all(&source_dir);
     result?;
@@ -454,14 +438,15 @@ pub(super) fn prepare_resolved_image(os: &str, path: &Path) -> Result<PathBuf> {
     let image = prepare_image(path)?;
     match os {
         "batocera" => {
-            let status = Command::new("qemu-img")
-                .args(["resize", "-f", "raw"])
-                .arg(&image)
-                .arg("128G")
-                .status()
-                .map_err(|error| Error::command_unavailable("qemu-img", error))?;
-            if !status.success() {
-                return Err(Error::command_failed_status("qemu-img resize", status));
+            let output = crate::qemu::run_qemu_img([
+                "resize".to_string(),
+                "-f".to_string(),
+                "raw".to_string(),
+                image.to_string_lossy().into_owned(),
+                "128G".to_string(),
+            ])?;
+            if !output.status.success() {
+                return Err(crate::qemu::qemu_img_failure("resize", output));
             }
             Ok(image)
         }
@@ -470,23 +455,18 @@ pub(super) fn prepare_resolved_image(os: &str, path: &Path) -> Result<PathBuf> {
                 .parent()
                 .ok_or_else(|| Error::message("EasyOS image has no parent directory"))?;
             let disk = parent.join("disk.qcow2");
-            if fs::symlink_metadata(&disk)
-                .ok()
-                .is_some_and(|metadata| metadata.file_type().is_symlink())
-            {
-                return Err(Error::message(format!(
-                    "refusing to write through symlink {}",
-                    disk.display()
-                )));
-            }
-            let status = Command::new("qemu-img")
-                .args(["convert", "-f", "raw", "-O", "qcow2"])
-                .arg(&image)
-                .arg(&disk)
-                .status()
-                .map_err(|error| Error::command_unavailable("qemu-img", error))?;
-            if !status.success() {
-                return Err(Error::command_failed_status("qemu-img convert", status));
+            crate::util::ensure_not_symlink(&disk, "write through")?;
+            let output = crate::qemu::run_qemu_img([
+                "convert".to_string(),
+                "-f".to_string(),
+                "raw".to_string(),
+                "-O".to_string(),
+                "qcow2".to_string(),
+                image.to_string_lossy().into_owned(),
+                disk.to_string_lossy().into_owned(),
+            ])?;
+            if !output.status.success() {
+                return Err(crate::qemu::qemu_img_failure("convert", output));
             }
             Ok(disk)
         }

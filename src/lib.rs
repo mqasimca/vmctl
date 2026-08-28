@@ -6,6 +6,7 @@ mod error;
 mod get;
 mod paths;
 mod qemu;
+mod util;
 
 use std::collections::BTreeSet;
 use std::env;
@@ -21,7 +22,10 @@ use clap::CommandFactory;
 use clap_complete::{CompleteEnv, Shell};
 
 #[cfg(unix)]
-use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+use std::os::unix::process::CommandExt;
+
+#[cfg(all(test, unix))]
+use std::os::unix::fs::PermissionsExt;
 
 use serde_json::{Value, json};
 
