@@ -433,7 +433,7 @@ pub(super) fn create_cached_cloud_vm(
     Ok(())
 }
 
-pub(super) fn create_cloud_seed(
+pub(crate) fn create_cloud_seed(
     target_dir: &Path,
     os: &str,
     hostname: &str,
@@ -567,7 +567,7 @@ fn read_public_keys(paths: &[PathBuf]) -> Result<Vec<String>> {
         .collect()
 }
 
-fn validate_hostname(hostname: &str) -> Result<()> {
+pub(crate) fn validate_hostname(hostname: &str) -> Result<()> {
     if hostname.is_empty()
         || hostname.len() > 253
         || hostname.split('.').any(|label| {

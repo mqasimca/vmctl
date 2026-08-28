@@ -33,6 +33,7 @@ vmctl cache prune                  # list unreferenced cached images
 vmctl cache prune --yes            # remove listed cached images
 vmctl backup VM ./VM-backup        # create a stopped-VM recovery backup
 vmctl reset VM --yes               # recreate a linked cloud VM's writable disk
+vmctl clone VM NEW-NAME            # copy a stopped VM's disk to a new VM
 vmctl disk VM info                 # qemu-img disk metadata
 vmctl disk VM resize 32G           # grow a stopped disk
 vmctl disk VM check                 # stopped-disk integrity check
@@ -259,6 +260,16 @@ unreferenced cache objects; `--yes` removes those objects and their cache-index
 entries. There is no automatic eviction. `vmctl reset VM --yes` is available
 only for the standard linked cloud-disk layout and recreates its writable overlay
 and UEFI variables from the verified cache base.
+
+`vmctl clone VM NEW-NAME` requires the source VM to be stopped. It converts the
+source disk to a new, self-contained `NEW-NAME/disk.qcow2` and writes a
+`NEW-NAME.conf` that preserves the source's settings while pointing at the new
+disk. Installer media and `cloud_base_img` references are dropped, and the MAC
+address is removed so QEMU assigns a fresh one; pass `--macaddr` to keep a
+specific address. For a cloud VM, `--hostname` (default `NEW-NAME`), `--ssh-key`,
+`--user-data`, and `--network-config` configure a freshly generated NoCloud seed
+identity; the source is never modified. Use `--user-data` only, not in
+combination with `--ssh-key`, to provide complete raw cloud-init configuration.
 
 `vmctl backup VM DIRECTORY` requires the VM to be stopped. It creates a new
 directory with a flattened compressed QCOW2 disk, `source.conf` for reference,

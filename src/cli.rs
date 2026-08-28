@@ -336,6 +336,40 @@ pub enum Command {
 
     /// Create a VM from a verified cached image.
     Create(CreateArgs),
+
+    /// Clone an existing VM's disk to a new VM.
+    Clone(CloneArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct CloneArgs {
+    /// Source VM to clone; it must be stopped.
+    #[arg(value_name = "SOURCE", add = ArgValueCompleter::new(complete_vm_names))]
+    pub source: String,
+
+    /// Name for the new VM.
+    #[arg(value_name = "NAME")]
+    pub name: String,
+
+    /// Persistent MAC address for the clone; omitted value lets QEMU assign a fresh one.
+    #[arg(long, value_name = "MAC")]
+    pub macaddr: Option<String>,
+
+    /// Host name configured in a cloud VM clone (defaults to the new VM name).
+    #[arg(long, value_name = "NAME")]
+    pub hostname: Option<String>,
+
+    /// OpenSSH public key to install in a cloud VM clone (repeatable).
+    #[arg(long = "ssh-key", value_name = "PATH")]
+    pub ssh_keys: Vec<PathBuf>,
+
+    /// Raw cloud-init user-data for a cloud VM clone; cannot combine with --ssh-key.
+    #[arg(long, value_name = "PATH")]
+    pub user_data: Option<PathBuf>,
+
+    /// cloud-init network-config file to include in a cloud VM clone seed image.
+    #[arg(long, value_name = "PATH")]
+    pub network_config: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Subcommand)]

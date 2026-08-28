@@ -1125,3 +1125,330 @@ fn tsc_warning_only_applies_to_risky_macos_hosts() {
         "quiet"
     ));
 }
+
+fn has_qemu_img() -> bool {
+    std::process::Command::new("qemu-img")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[test]
+fn clone_command_is_typed() {
+    let cli = Cli::try_parse_from([
+        "vmctl",
+        "clone",
+        "ubuntu",
+        "ubuntu-copy",
+        "--macaddr",
+        "52:54:00:12:34:56",
+        "--hostname",
+        "copy",
+        "--ssh-key",
+        "id.pub",
+    ])
+    .unwrap();
+    let Some(VmCommand::Clone(args)) = cli.command else {
+        panic!("expected clone command");
+    };
+    assert_eq!(args.source, "ubuntu");
+    assert_eq!(args.name, "ubuntu-copy");
+    assert_eq!(args.macaddr.as_deref(), Some("52:54:00:12:34:56"));
+    assert_eq!(args.hostname.as_deref(), Some("copy"));
+    assert_eq!(args.ssh_keys, [PathBuf::from("id.pub")]);
+}
+
+#[test]
+fn clone_rejects_user_data_and_ssh_key_together() {
+    let cli = Cli::try_parse_from([
+        "vmctl",
+        "clone",
+        "ubuntu",
+        "ubuntu-copy",
+        "--user-data",
+        "cloud.yaml",
+        "--ssh-key",
+        "id.pub",
+    ])
+    .unwrap();
+    let Some(VmCommand::Clone(args)) = cli.command else {
+        panic!("expected clone command");
+    };
+    assert!(
+        clone_vm(
+            &Dirs {
+                vm_dir: PathBuf::from("/nonexistent/vms"),
+                state_root: PathBuf::from("/nonexistent/state"),
+            },
+            &args,
+            OutputFormat::Human
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("cannot be combined with --ssh-key")
+    );
+}
+
+#[test]
+fn clone_rejects_a_matching_target_name() {
+    let root = tempfile::tempdir().unwrap();
+    let dirs = Dirs {
+        vm_dir: root.path().join("vms"),
+        state_root: root.path().join("state"),
+    };
+    std::fs::create_dir_all(&dirs.vm_dir).unwrap();
+    std::fs::write(dirs.vm_dir.join("vm.conf"), "disk_img=\"vm/disk.qcow2\"\n").unwrap();
+    let args = CloneArgs {
+        source: "vm".to_string(),
+        name: "vm".to_string(),
+        macaddr: None,
+        hostname: None,
+        ssh_keys: Vec::new(),
+        user_data: None,
+        network_config: None,
+    };
+    assert!(
+        clone_vm(&dirs, &args, OutputFormat::Human)
+            .unwrap_err()
+            .to_string()
+            .contains("must differ from the source VM name")
+    );
+}
+
+#[test]
+fn clone_rejects_a_cloud_target_name_that_is_invalid_as_a_hostname() {
+    if !has_qemu_img() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let dirs = Dirs {
+        vm_dir: root.path().join("vms"),
+        state_root: root.path().join("state"),
+    };
+    std::fs::create_dir_all(dirs.vm_dir.join("vm")).unwrap();
+    let source_disk = dirs.vm_dir.join("vm/disk.qcow2");
+    assert!(
+        std::process::Command::new("qemu-img")
+            .args(["create", "-q", "-f", "qcow2"])
+            .arg(&source_disk)
+            .arg("8M")
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::write(
+        dirs.vm_dir.join("vm.conf"),
+        "disk_img=\"vm/disk.qcow2\"\nssh_user=\"ubuntu\"\n",
+    )
+    .unwrap();
+    let args = CloneArgs {
+        source: "vm".to_string(),
+        name: "copy_vm".to_string(),
+        macaddr: None,
+        hostname: None,
+        ssh_keys: Vec::new(),
+        user_data: None,
+        network_config: None,
+    };
+    assert!(
+        clone_vm(&dirs, &args, OutputFormat::Human)
+            .unwrap_err()
+            .to_string()
+            .contains("--hostname")
+    );
+    assert!(!dirs.vm_dir.join("copy_vm").exists());
+    assert!(!dirs.vm_dir.join("copy_vm.conf").exists());
+}
+
+#[test]
+fn clone_allows_a_non_cloud_name_with_an_underscore() {
+    if !has_qemu_img() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let dirs = Dirs {
+        vm_dir: root.path().join("vms"),
+        state_root: root.path().join("state"),
+    };
+    std::fs::create_dir_all(dirs.vm_dir.join("vm")).unwrap();
+    let source_disk = dirs.vm_dir.join("vm/disk.qcow2");
+    assert!(
+        std::process::Command::new("qemu-img")
+            .args(["create", "-q", "-f", "qcow2"])
+            .arg(&source_disk)
+            .arg("8M")
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::write(
+        dirs.vm_dir.join("vm.conf"),
+        "disk_img=\"vm/disk.qcow2\"\nguest_os=\"linux\"\n",
+    )
+    .unwrap();
+    let args = CloneArgs {
+        source: "vm".to_string(),
+        name: "copy_vm".to_string(),
+        macaddr: None,
+        hostname: None,
+        ssh_keys: Vec::new(),
+        user_data: None,
+        network_config: None,
+    };
+    clone_vm(&dirs, &args, OutputFormat::Human).unwrap();
+    assert!(dirs.vm_dir.join("copy_vm.conf").exists());
+}
+
+#[test]
+fn clone_rejects_an_existing_target_config() {
+    if !has_qemu_img() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let dirs = Dirs {
+        vm_dir: root.path().join("vms"),
+        state_root: root.path().join("state"),
+    };
+    std::fs::create_dir_all(dirs.vm_dir.join("src")).unwrap();
+    let source_disk = dirs.vm_dir.join("src/disk.qcow2");
+    assert!(
+        std::process::Command::new("qemu-img")
+            .args(["create", "-q", "-f", "qcow2"])
+            .arg(&source_disk)
+            .arg("8M")
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::write(
+        dirs.vm_dir.join("src.conf"),
+        "disk_img=\"src/disk.qcow2\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dirs.vm_dir.join("dst.conf"),
+        "disk_img=\"dst/disk.qcow2\"\n",
+    )
+    .unwrap();
+    let args = CloneArgs {
+        source: "src".to_string(),
+        name: "dst".to_string(),
+        macaddr: None,
+        hostname: None,
+        ssh_keys: Vec::new(),
+        user_data: None,
+        network_config: None,
+    };
+    assert!(
+        clone_vm(&dirs, &args, OutputFormat::Human)
+            .unwrap_err()
+            .to_string()
+            .contains("configuration already exists")
+    );
+    assert!(!dirs.vm_dir.join("dst").exists());
+}
+
+#[test]
+fn clone_preserves_settings_and_makes_an_independent_disk() {
+    if !has_qemu_img() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let dirs = Dirs {
+        vm_dir: root.path().join("vms"),
+        state_root: root.path().join("state"),
+    };
+    std::fs::create_dir_all(dirs.vm_dir.join("src")).unwrap();
+    let source_disk = dirs.vm_dir.join("src/disk.qcow2");
+    assert!(
+        std::process::Command::new("qemu-img")
+            .args(["create", "-q", "-f", "qcow2"])
+            .arg(&source_disk)
+            .arg("8M")
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::write(
+        dirs.vm_dir.join("src.conf"),
+        "guest_os=\"linux\"\narch=\"x86_64\"\nram=\"4G\"\ncpu_cores=\"2\"\n\
+         disk_img=\"src/disk.qcow2\"\niso=\"src/install.iso\"\nmacaddr=\"52:54:00:11:22:33\"\n",
+    )
+    .unwrap();
+
+    let args = CloneArgs {
+        source: "src".to_string(),
+        name: "dst".to_string(),
+        macaddr: None,
+        hostname: None,
+        ssh_keys: Vec::new(),
+        user_data: None,
+        network_config: None,
+    };
+    clone_vm(&dirs, &args, OutputFormat::Human).unwrap();
+
+    let config = std::fs::read_to_string(dirs.vm_dir.join("dst.conf")).unwrap();
+    assert!(config.contains("disk_img=\"dst/disk.qcow2\""));
+    assert!(config.contains("ram=\"4G\""));
+    assert!(config.contains("cpu_cores=\"2\""));
+    assert!(config.contains("guest_os=\"linux\""));
+    assert!(!config.contains("macaddr"));
+    assert!(!config.contains("iso="));
+
+    let disk = crate::qemu::disk_info(&dirs.vm_dir.join("dst/disk.qcow2")).unwrap();
+    assert_eq!(disk["virtual-size"], 8 * 1024_u64.pow(2));
+    assert!(
+        disk.get("backing-filename").is_none(),
+        "clone disk must be self-contained"
+    );
+
+    let cloned =
+        crate::config::load_vm(&dirs.vm_dir, &dirs.state_root, dirs.vm_dir.join("dst.conf"))
+            .unwrap();
+    assert_eq!(cloned.config.ram.as_deref(), Some("4G"));
+    assert_eq!(cloned.config.cpu_cores, Some(2));
+    assert_eq!(cloned.config.macaddr, None);
+}
+
+#[test]
+fn clone_preserves_an_explicit_macaddr() {
+    if !has_qemu_img() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let dirs = Dirs {
+        vm_dir: root.path().join("vms"),
+        state_root: root.path().join("state"),
+    };
+    std::fs::create_dir_all(dirs.vm_dir.join("src")).unwrap();
+    let source_disk = dirs.vm_dir.join("src/disk.qcow2");
+    assert!(
+        std::process::Command::new("qemu-img")
+            .args(["create", "-q", "-f", "qcow2"])
+            .arg(&source_disk)
+            .arg("8M")
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::write(
+        dirs.vm_dir.join("src.conf"),
+        "disk_img=\"src/disk.qcow2\"\n",
+    )
+    .unwrap();
+    let args = CloneArgs {
+        source: "src".to_string(),
+        name: "dst".to_string(),
+        macaddr: Some("52:54:00:aa:bb:cc".to_string()),
+        hostname: None,
+        ssh_keys: Vec::new(),
+        user_data: None,
+        network_config: None,
+    };
+    clone_vm(&dirs, &args, OutputFormat::Human).unwrap();
+    let config = std::fs::read_to_string(dirs.vm_dir.join("dst.conf")).unwrap();
+    assert!(config.contains("macaddr=\"52:54:00:aa:bb:cc\""));
+}

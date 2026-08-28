@@ -324,7 +324,7 @@ pub(super) fn input_file_name(input: &str) -> Result<String> {
         .ok_or_else(|| Error::message("image path does not contain a file name"))
 }
 
-pub(super) fn validate_vm_name(name: &str) -> Result<&str> {
+pub(crate) fn validate_vm_name(name: &str) -> Result<&str> {
     if name.is_empty()
         || name == "."
         || name == ".."

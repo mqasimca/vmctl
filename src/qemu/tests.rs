@@ -1,5 +1,6 @@
 use super::*;
 use crate::config::load_vm;
+use disk::validate_disk_format;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::symlink;

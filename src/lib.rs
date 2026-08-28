@@ -28,8 +28,8 @@ use serde_json::{Value, json};
 pub(crate) use agent::print_json_success;
 
 use cli::{
-    CacheAction, Cli, Command as VmCommand, DiskAction, GuestAction, HostAction, LaunchOptions,
-    OutputFormat, SnapshotAction, StartWait,
+    CacheAction, Cli, CloneArgs, Command as VmCommand, DiskAction, GuestAction, HostAction,
+    LaunchOptions, OutputFormat, SnapshotAction, StartWait,
 };
 use config::{discover, find};
 use paths::Dirs;
@@ -153,6 +153,7 @@ pub fn run(cli: Cli) -> Result<()> {
         VmCommand::Host { action } => host_action(action, output),
         VmCommand::Get(args) => get::run(&args, &dirs, output),
         VmCommand::Create(args) => get::create(&args, &dirs, output),
+        VmCommand::Clone(args) => clone_vm(&dirs, &args, output),
     }
 }
 
@@ -208,6 +209,9 @@ use presentation::*;
 #[path = "commands/runtime.rs"]
 mod runtime;
 use runtime::*;
+#[path = "commands/clone.rs"]
+mod clone;
+use clone::*;
 
 #[cfg(test)]
 #[path = "commands/tests.rs"]

@@ -304,7 +304,7 @@ pub(crate) fn disk_compact(path: &Path) -> Result<Value> {
     disk_info(path)
 }
 
-pub(super) fn require_disk_file(path: &Path) -> Result<()> {
+pub(crate) fn require_disk_file(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path).map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
             Error::message(format!(
@@ -340,7 +340,7 @@ pub(crate) fn validate_disk_size(size: &str) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn validate_disk_format(format: &str) -> Result<()> {
+pub(crate) fn validate_disk_format(format: &str) -> Result<()> {
     if format.is_empty()
         || format.starts_with('-')
         || format.chars().any(|character| {
